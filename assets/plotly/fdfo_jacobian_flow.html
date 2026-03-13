@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jacobian Gradient Transport — Fractal Tree</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;background:white;padding:16px}
+.wrap{max-width:720px;margin:0 auto}
+.cbox{position:relative;width:100%;aspect-ratio:1/1;border-radius:16px;overflow:hidden;background:#fafafa;cursor:crosshair}
+#bg{position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:auto}
+#fg{position:absolute;top:0;left:0;width:100%;height:100%}
+.row{display:flex;justify-content:center;gap:8px;margin:12px auto 0;flex-wrap:wrap}
+.btn{padding:7px 16px;font:bold 13px Arial;border:2px solid #18327E;border-radius:6px;cursor:pointer;background:white;color:#18327E;user-select:none;transition:background .12s,color .12s}
+.btn.on{background:#18327E;color:white}
+.btn:hover{opacity:.85}
+.srow{display:flex;align-items:center;justify-content:center;gap:12px;margin:12px auto 0;max-width:480px}
+.srow label{font:bold 13px Arial;color:#333;white-space:nowrap}
+.srow .v{color:#18327E;min-width:24px;text-align:right}
+input[type=range]{flex:1;height:5px;border-radius:5px;background:#ddd;outline:none;-webkit-appearance:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#18327E;cursor:pointer}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:#18327E;cursor:pointer;border:none}
+.ro{text-align:center;font:bold 14px Arial;color:#333;margin:10px 0 0;min-height:20px}
+.cap{text-align:center;margin-top:10px;color:#666;font-size:13px;line-height:1.5}
+.loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font:bold 16px Arial;color:#18327E}
+@media(max-width:600px){body{padding:8px}.btn{padding:5px 10px;font-size:11px}.cap{font-size:11px}input[type=range]::-webkit-slider-thumb{width:26px;height:26px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="cbox" id="box">
+    <canvas id="bg"></canvas>
+    <canvas id="fg"></canvas>
+    <div class="loading" id="loadMsg">Rendering tree...</div>
+  </div>
+  <div class="srow">
+    <label>Step: <span class="v" id="stepVal">20</span>/20</label>
+    <input type="range" id="stepSlider" min="0" max="200" value="200" step="1">
+    <button class="btn" id="playBtn" style="padding:5px 12px;font-size:16px;border-color:#C8372C;color:#C8372C" onclick="togglePlay()">&#9654;</button>
+  </div>
+  <div class="row">
+    <button class="btn on" id="bE" onclick="setMode('exact')">Exact Backprop</button>
+    <button class="btn" id="bC" onclick="setMode('copy')">Copied Gradient (FDFO)</button>
+    <button class="btn" id="bB" onclick="setMode('both')">Compare Both</button>
+  </div>
+  <div class="ro" id="ro"></div>
+  <div class="cap">
+    <b>Click or drag</b> to place a noisy sample x&#x2080; near the fractal.
+    The ODE denoises from x&#x2080; toward the nearest branch; use the step slider
+    to walk along the chain and see how the Jacobian transports the reward gradient.
+  </div>
+</div>
+
+<script>
+// ================================================================
+// Seeded PRNG (mulberry32)
+// ================================================================
+function mb32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function mkGauss(rng){return function(){const u=rng(),v=rng();return Math.sqrt(-2*Math.log(u+1e-12))*Math.cos(6.2832*v)}}
+
+// ================================================================
+// Build fractal tree distribution (autoguidance style)
+// ================================================================
+const COMPS=[];  // {mu:[2], S:[[2x2]], Sinv:[[2x2]], det:f, phi:f, cls:str}
+const BRANCHES=[]; // {x0,y0,x1,y1,depth,cls} — branch segments in data coords (scaled)
+
+function buildTree(){
+  const rng=mb32(2);
+  const gauss=mkGauss(rng);
+  const origin=[0.0030,0.0325];
+  const scale=[1.3136,1.3844];
+
+  function recurse(cls,depth,pos,angle){
+    if(depth>=7)return;
+    const cdx=Math.cos(angle),cdy=Math.sin(angle);
+    const distR=gauss()*0.2+1;
+    const dist=0.292*Math.pow(0.8,depth)*distR;
+    const thick=Math.min(0.2*Math.pow(0.8,depth)/dist, 0.999); // clamp to avoid degenerate covariance
+    const sz0=scale[0]*dist*0.06, sz1=scale[1]*dist*0.06;
+    const phi=dist*Math.pow(0.5,depth);
+
+    // Store branch segment for vector rendering
+    BRANCHES.push({
+      x0:pos[0]*scale[0], y0:pos[1]*scale[1],
+      x1:(pos[0]+cdx*dist)*scale[0], y1:(pos[1]+cdy*dist)*scale[1],
+      depth:depth, cls:cls
+    });
+
+    for(let i=0;i<8;i++){
+      const t=0.07+(0.93-0.07)*i/7;
+      const mx=(pos[0]+cdx*dist*t)*scale[0];
+      const my=(pos[1]+cdy*dist*t)*scale[1];
+      // Covariance: S = dir*dir^T * (sz^2 - thick^2*sz^2) + thick^2*sz^2 * I
+      // This creates an ellipse elongated along the branch direction
+      const a00=sz0*sz0, a11=sz1*sz1;
+      const b00=thick*thick*a00, b11=thick*thick*a11;
+      const S00=cdx*cdx*(a00-b00)+b00;
+      const S01=cdx*cdy*Math.sqrt(Math.abs((a00-b00)*(a11-b11)))*Math.sign(a00-b00);
+      const S11=cdy*cdy*(a11-b11)+b11;
+      const det=S00*S11-S01*S01;
+      if(det<1e-30)continue;
+      const idet=1/det;
+      COMPS.push({
+        mu:[mx,my],
+        S:[[S00,S01],[S01,S11]],
+        Sinv:[[S11*idet,-S01*idet],[-S01*idet,S00*idet]],
+        det:det,
+        phi:phi,
+        cls:cls,
+        depth:depth
+      });
+    }
+    for(const sign of[1,-1]){
+      const angleNew=angle+sign*Math.pow(0.7,depth)*(gauss()*0.2+1);
+      recurse(cls,depth+1,[pos[0]+cdx*dist,pos[1]+cdy*dist],angleNew);
+    }
+  }
+
+  recurse('A',0,[origin[0],origin[1]],Math.PI*0.25);
+  recurse('B',0,[origin[0],origin[1]],Math.PI*1.25);
+}
+buildTree();
+
+// ================================================================
+// View bounds (auto from component positions + padding)
+// ================================================================
+let VX0=Infinity,VX1=-Infinity,VY0=Infinity,VY1=-Infinity;
+for(const c of COMPS){
+  const r=3*Math.sqrt(Math.max(c.S[0][0],c.S[1][1]));
+  VX0=Math.min(VX0,c.mu[0]-r); VX1=Math.max(VX1,c.mu[0]+r);
+  VY0=Math.min(VY0,c.mu[1]-r); VY1=Math.max(VY1,c.mu[1]+r);
+}
+const pad=0.12*Math.max(VX1-VX0,VY1-VY0);
+VX0-=pad;VX1+=pad;VY0-=pad;VY1+=pad;
+const span=Math.max(VX1-VX0,VY1-VY0);
+const vcx=(VX0+VX1)/2, vcy=(VY0+VY1)/2;
+VX0=vcx-span/2;VX1=vcx+span/2;VY0=vcy-span/2;VY1=vcy+span/2;
+
+// ================================================================
+// Spatial index for fast component lookup
+// ================================================================
+const GRID_CELLS=32;
+const spatialGrid=new Array(GRID_CELLS*GRID_CELLS);
+for(let i=0;i<spatialGrid.length;i++)spatialGrid[i]=[];
+
+function cellIdx(x,y){
+  const ci=Math.floor((x-VX0)/(VX1-VX0)*GRID_CELLS);
+  const cj=Math.floor((y-VY0)/(VY1-VY0)*GRID_CELLS);
+  return[Math.max(0,Math.min(GRID_CELLS-1,ci)),Math.max(0,Math.min(GRID_CELLS-1,cj))];
+}
+
+for(let k=0;k<COMPS.length;k++){
+  const c=COMPS[k];
+  const r=4*Math.sqrt(Math.max(c.S[0][0],c.S[1][1]));
+  const[ci0,cj0]=cellIdx(c.mu[0]-r,c.mu[1]-r);
+  const[ci1,cj1]=cellIdx(c.mu[0]+r,c.mu[1]+r);
+  for(let ci=ci0;ci<=ci1;ci++)for(let cj=cj0;cj<=cj1;cj++){
+    spatialGrid[cj*GRID_CELLS+ci].push(k);
+  }
+}
+
+function nearbyComps(x,y,extraR){
+  const r=extraR+SIGMA_MAX;
+  const[ci0,cj0]=cellIdx(x-r,y-r);
+  const[ci1,cj1]=cellIdx(x+r,y+r);
+  const seen=new Set();
+  const result=[];
+  for(let ci=ci0;ci<=ci1;ci++)for(let cj=cj0;cj<=cj1;cj++){
+    for(const k of spatialGrid[cj*GRID_CELLS+ci]){
+      if(!seen.has(k)){seen.add(k);result.push(k);}
+    }
+  }
+  return result;
+}
+
+// ================================================================
+// Vector rendering of fractal tree on background canvas
+// ================================================================
+const MAX_DEPTH=6; // max depth is 6 (recurse stops at depth>=7)
+
+// Color palette: warm organic tones, trunk->tips
+// Trunk: deep warm brown;  Tips: soft dusty rose / peach
+function branchRGB(depth){
+  const t=depth/MAX_DEPTH;
+  // Smooth interpolation through a warm palette
+  // depth 0: #6B3A2A (dark warm brown)
+  // depth 3: #B87850 (warm sienna)
+  // depth 6: #D4AA90 (dusty peach)
+  const r=Math.round(107+100*t);   // 107 -> 207
+  const g=Math.round(58+112*t);    // 58  -> 170
+  const b=Math.round(42+102*t);    // 42  -> 144
+  return[r,g,b];
+}
+
+function renderVectorTree(){
+  const bgC=document.getElementById('bg');
+  const bgDpr=window.devicePixelRatio||1;
+  const box=document.getElementById('box');
+  const rect=box.getBoundingClientRect();
+  const bW=rect.width, bH=rect.height;
+  bgC.width=bW*bgDpr; bgC.height=bH*bgDpr;
+  bgC.style.width=bW+'px'; bgC.style.height=bH+'px';
+  const ctx=bgC.getContext('2d');
+  ctx.scale(bgDpr,bgDpr);
+
+  // Fill background
+  ctx.fillStyle='#faf8f6';
+  ctx.fillRect(0,0,bW,bH);
+
+  // Coordinate mapping (data -> pixel)
+  const scX=bW/(VX1-VX0), scY=bH/(VY1-VY0);
+  function toP(dx,dy){return[(dx-VX0)*scX,(VY1-dy)*scY];}
+
+  // Sort branches: deepest first so trunk paints over tips
+  const sorted=BRANCHES.slice().sort((a,b)=>b.depth-a.depth);
+
+  ctx.lineCap='round';
+  ctx.lineJoin='round';
+
+  // === Pass 1: Gaussian ellipse halos ===
+  // Draw each MoG component as a soft filled ellipse for the "probability cloud" feel.
+  // We use 2-sigma contours with very low opacity; the overlap of many ellipses
+  // builds up a natural density visualization.
+  for(const c of COMPS){
+    const[px,py]=toP(c.mu[0],c.mu[1]);
+
+    // Eigendecomposition of 2x2 covariance for ellipse parameters
+    const a=c.S[0][0], b2=c.S[0][1], d=c.S[1][1];
+    const trace=a+d, det=a*d-b2*b2;
+    const disc=Math.sqrt(Math.max(0, trace*trace/4-det));
+    const lam1=trace/2+disc, lam2=Math.max(1e-12, trace/2-disc);
+
+    // Semi-axes at 2-sigma (in data coords), then convert to pixels
+    const sig=2.0;
+    const r1=sig*Math.sqrt(lam1);
+    const r2=sig*Math.sqrt(lam2);
+    // Pixel radii (use average scale for near-square aspect)
+    const pr1=r1*scX, pr2=r2*scX;
+    if(pr1<0.3||pr2<0.3)continue; // skip sub-pixel ellipses
+
+    // Rotation angle of the principal axis
+    let theta=0;
+    if(Math.abs(b2)>1e-15){
+      theta=Math.atan2(lam1-a, b2);
+    } else if(d>a){
+      theta=Math.PI/2;
+    }
+    // Canvas y is flipped, so negate the angle
+    const cTheta=-theta;
+
+    // Very soft fill; overlapping ellipses accumulate nicely
+    const[cr,cg,cb]=branchRGB(c.depth);
+    const alpha=0.025;
+
+    ctx.save();
+    ctx.translate(px,py);
+    ctx.rotate(cTheta);
+    ctx.scale(pr1,pr2);
+    ctx.fillStyle=`rgba(${cr},${cg},${cb},${alpha})`;
+    ctx.beginPath();
+    ctx.arc(0,0,1,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // === Pass 2: wider soft glow strokes for branch structure ===
+  for(const br of sorted){
+    const[px0,py0]=toP(br.x0,br.y0);
+    const[px1,py1]=toP(br.x1,br.y1);
+    const[cr,cg,cb]=branchRGB(br.depth);
+    // Wide soft glow
+    const glowW=Math.max(2, 22*Math.pow(0.60,br.depth));
+    const glowAlpha=0.05*Math.pow(0.72,br.depth);
+    ctx.strokeStyle=`rgba(${cr},${cg},${cb},${glowAlpha})`;
+    ctx.lineWidth=glowW;
+    ctx.beginPath();ctx.moveTo(px0,py0);ctx.lineTo(px1,py1);ctx.stroke();
+  }
+
+  // === Pass 3: medium glow for body ===
+  for(const br of sorted){
+    const[px0,py0]=toP(br.x0,br.y0);
+    const[px1,py1]=toP(br.x1,br.y1);
+    const[cr,cg,cb]=branchRGB(br.depth);
+    const midW=Math.max(1.5, 14*Math.pow(0.60,br.depth));
+    const midAlpha=0.10*Math.pow(0.75,br.depth);
+    ctx.strokeStyle=`rgba(${cr},${cg},${cb},${midAlpha})`;
+    ctx.lineWidth=midW;
+    ctx.beginPath();ctx.moveTo(px0,py0);ctx.lineTo(px1,py1);ctx.stroke();
+  }
+
+  // === Pass 4: tapered filled branch shapes (crisp core) ===
+  // Each branch is drawn as a filled quadrilateral that tapers from
+  // base width to tip width, giving a natural organic look.
+  for(const br of sorted){
+    const[px0,py0]=toP(br.x0,br.y0);
+    const[px1,py1]=toP(br.x1,br.y1);
+    const dx=px1-px0, dy=py1-py0;
+    const len=Math.sqrt(dx*dx+dy*dy);
+    if(len<0.5)continue;
+    // Perpendicular unit vector
+    const nx=-dy/len, ny=dx/len;
+
+    // Width at base and tip (in pixels)
+    const wBase=Math.max(0.8, 6.0*Math.pow(0.56,br.depth));
+    const wTip =Math.max(0.4, 6.0*Math.pow(0.56,br.depth+1));
+
+    const[cr,cg,cb]=branchRGB(br.depth);
+    const alpha=Math.max(0.35, 0.92-br.depth*0.09);
+
+    // Draw tapered quad
+    ctx.fillStyle=`rgba(${cr},${cg},${cb},${alpha})`;
+    ctx.beginPath();
+    ctx.moveTo(px0+nx*wBase/2, py0+ny*wBase/2);
+    ctx.lineTo(px1+nx*wTip/2,  py1+ny*wTip/2);
+    ctx.lineTo(px1-nx*wTip/2,  py1-ny*wTip/2);
+    ctx.lineTo(px0-nx*wBase/2, py0-ny*wBase/2);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // === Pass 5: thin bright highlight along branch centers ===
+  // A subtle lighter line down the center of each branch for a "shiny bark" effect
+  for(const br of sorted){
+    if(br.depth>4)continue; // only on thicker branches
+    const[px0,py0]=toP(br.x0,br.y0);
+    const[px1,py1]=toP(br.x1,br.y1);
+    const hlW=Math.max(0.3, 1.5*Math.pow(0.55,br.depth));
+    const hlAlpha=0.15*Math.pow(0.6,br.depth);
+    ctx.strokeStyle=`rgba(255,245,235,${hlAlpha})`;
+    ctx.lineWidth=hlW;
+    ctx.beginPath();ctx.moveTo(px0,py0);ctx.lineTo(px1,py1);ctx.stroke();
+  }
+}
+
+// ================================================================
+// Flow matching ODE — variance-exploding (VE) schedule
+// ================================================================
+// The data is NEVER scaled.  Noise is added on top:
+//   x_t = x_1 + sigma(t) * eps,   eps ~ N(0, I)
+// where sigma(t) = SIGMA_MAX * (1 - t).
+//
+// Marginal at time t for component k:
+//   x_t | k ~ N(mu_k,  S_k + sigma(t)^2 * I)
+//
+// Because the mean stays at mu_k for ALL t (data is never shrunk),
+// the posterior E[x_1|x_t] naturally selects the nearest branch —
+// no snapping heuristic required.
+//
+// Velocity: v(x,t) = (E[x_1|x_t=x] - x) / (1 - t)
+
+const N_STEPS=20;
+const SIGMA_MAX=1.0;            // moderate: soft posteriors near branch boundaries for smooth transitions
+const SIGMA2=SIGMA_MAX*SIGMA_MAX;
+
+function flowVelocity(x,y,t){
+  const tc=Math.max(1e-5,Math.min(1-1e-5,t));
+  const omt=1-tc; // (1-t)
+  const noiseVar=omt*omt*SIGMA2; // (1-t)^2 * sigma^2
+
+  // Search radius depends on noise level
+  const nearby=nearbyComps(x,y,Math.sqrt(noiseVar)*3);
+
+  let sumW=0, Ex=0, Ey=0;
+
+  for(const k of nearby){
+    const c=COMPS[k];
+    // Marginal: x_t | k ~ N(mu_k, S_k + (1-t)^2*sigma^2*I)
+    const mS00=c.S[0][0]+noiseVar;
+    const mS01=c.S[0][1];
+    const mS11=c.S[1][1]+noiseVar;
+    const mDet=mS00*mS11-mS01*mS01;
+    if(Math.abs(mDet)<1e-30)continue;
+
+    // Mahalanobis distance for component weight
+    const mI00=mS11/mDet, mI01=-mS01/mDet, mI11=mS00/mDet;
+    const dx=x-c.mu[0], dy=y-c.mu[1];   // note: centred on mu_k, not t*mu_k
+    const m=dx*dx*mI00+2*dx*dy*mI01+dy*dy*mI11;
+    if(m>50)continue;
+    const w=c.phi*Math.exp(-0.5*m)/(6.2832*Math.sqrt(mDet));
+
+    // Posterior mean of x_1 given (x_t, component k):
+    //   x_1 | (x_t, k) has mean = mu_k + S_k (S_k + nv I)^{-1} (x_t - mu_k)
+    //   where nv = (1-t)^2 * sigma^2
+    const pS00=c.S[0][0]+noiseVar;   // S_k + nv*I  (same as marginal cov)
+    const pS01=c.S[0][1];
+    const pS11=c.S[1][1]+noiseVar;
+    const pDet=pS00*pS11-pS01*pS01;
+    if(Math.abs(pDet)<1e-30){
+      sumW+=w; Ex+=w*c.mu[0]; Ey+=w*c.mu[1]; continue;
+    }
+    const pI00=pS11/pDet, pI01=-pS01/pDet, pI11=pS00/pDet;
+
+    // r = x_t - mu_k
+    const rx=x-c.mu[0], ry=y-c.mu[1];
+    // K*r = S_k * (S_k + nv*I)^{-1} * r
+    const Pr0=pI00*rx+pI01*ry;
+    const Pr1=pI01*rx+pI11*ry;
+    const Kx=c.S[0][0]*Pr0+c.S[0][1]*Pr1;
+    const Ky=c.S[0][1]*Pr0+c.S[1][1]*Pr1;
+
+    const postX=c.mu[0]+Kx;
+    const postY=c.mu[1]+Ky;
+
+    sumW+=w;
+    Ex+=w*postX;
+    Ey+=w*postY;
+  }
+
+  if(sumW<1e-30)return[0,0];
+  Ex/=sumW; Ey/=sumW;
+  return[(Ex-x)/omt,(Ey-y)/omt];
+}
+
+// ================================================================
+// ODE integration + Jacobian accumulation
+// ================================================================
+let odePath=[];
+let odeJacs=[];
+let x0=[0.35,0.45]; // near a branch of the fractal tree
+
+function integrateODE(){
+  odePath=[];odeJacs=[];
+  const tS=0.01, tE=0.995, tR=tE-tS, dt=tR/N_STEPS;
+  let px=x0[0], py=x0[1];
+  for(let s=0;s<=N_STEPS;s++){
+    const t=tS+s/N_STEPS*tR;
+    odePath.push({pos:[px,py],t:t});
+    if(s<N_STEPS){
+      const[vx,vy]=flowVelocity(px,py,t);
+      px+=vx*dt; py+=vy*dt;
+    }
+  }
+  // Jacobian accumulation (backward from data to noise)
+  // J_cum(s) = Jacobian of the map from step s to the final step
+  // J_cum(N) = I
+  // J_cum(s) = J_cum(s+1) * (I + dt * dv/dx_s)
+  odeJacs=new Array(N_STEPS+1);
+  odeJacs[N_STEPS]=[[1,0],[0,1]];
+  for(let s=N_STEPS-1;s>=0;s--){
+    const[px2,py2]=odePath[s].pos;
+    const t=odePath[s].t;
+    const h=5e-4;
+    const vxp=flowVelocity(px2+h,py2,t), vxm=flowVelocity(px2-h,py2,t);
+    const vyp=flowVelocity(px2,py2+h,t), vym=flowVelocity(px2,py2-h,t);
+    // dv/dx: 2x2 Jacobian of velocity w.r.t. position
+    const dvdx=[
+      [(vxp[0]-vxm[0])/(2*h), (vyp[0]-vym[0])/(2*h)],
+      [(vxp[1]-vxm[1])/(2*h), (vyp[1]-vym[1])/(2*h)]
+    ];
+    // One-step Jacobian: I + dt * dv/dx
+    const sJ=[
+      [1+dt*dvdx[0][0], dt*dvdx[0][1]],
+      [dt*dvdx[1][0], 1+dt*dvdx[1][1]]
+    ];
+    // Cumulative: J_cum(s) = J_cum(s+1) * sJ
+    const J=odeJacs[s+1];
+    odeJacs[s]=[
+      [J[0][0]*sJ[0][0]+J[0][1]*sJ[1][0], J[0][0]*sJ[0][1]+J[0][1]*sJ[1][1]],
+      [J[1][0]*sJ[0][0]+J[1][1]*sJ[1][0], J[1][0]*sJ[0][1]+J[1][1]*sJ[1][1]]
+    ];
+  }
+}
+
+// ================================================================
+// Interpolation helpers for smooth slider
+// ================================================================
+// viewStepF is a float in [0, N_STEPS]; integer values correspond
+// to the discrete ODE steps.  Between integers we linearly
+// interpolate position and Jacobian so the slider feels continuous.
+
+function lerpPos(f){
+  const lo=Math.floor(f), hi=Math.min(lo+1,N_STEPS);
+  const a=f-lo;
+  return[
+    odePath[lo].pos[0]*(1-a)+odePath[hi].pos[0]*a,
+    odePath[lo].pos[1]*(1-a)+odePath[hi].pos[1]*a
+  ];
+}
+function lerpJac(f){
+  const lo=Math.floor(f), hi=Math.min(lo+1,N_STEPS);
+  const a=f-lo;
+  const A=odeJacs[lo], B=odeJacs[hi];
+  return[
+    [A[0][0]*(1-a)+B[0][0]*a, A[0][1]*(1-a)+B[0][1]*a],
+    [A[1][0]*(1-a)+B[1][0]*a, A[1][1]*(1-a)+B[1][1]*a]
+  ];
+}
+
+// ================================================================
+// State
+// ================================================================
+let fgCanvas,fgCtx,W,H,dpr;
+let gradAngle=Math.PI*0.6;
+let mode='exact';
+let viewStepF=N_STEPS; // float in [0, N_STEPS]
+let isDrag=false, dragTarget=null;
+let playing=false, playTimer=null;
+const isMobile=window.innerWidth<=600;
+const SLIDER_RES=200; // slider range is 0..SLIDER_RES
+
+// ================================================================
+// Coord mapping
+// ================================================================
+function d2p(dx,dy){return[(dx-VX0)/(VX1-VX0)*W,(VY1-dy)/(VY1-VY0)*H];}
+function p2d(px,py){return[px/W*(VX1-VX0)+VX0,VY1-py/H*(VY1-VY0)];}
+
+// ================================================================
+// Math helpers
+// ================================================================
+const m2v=(A,v)=>[A[0][0]*v[0]+A[0][1]*v[1],A[1][0]*v[0]+A[1][1]*v[1]];
+const m2T=A=>[[A[0][0],A[1][0]],[A[0][1],A[1][1]]];
+const vl=v=>Math.sqrt(v[0]*v[0]+v[1]*v[1]);
+const vn=v=>{const l=vl(v);return l>1e-15?[v[0]/l,v[1]/l]:[1,0]};
+const vd=(a,b)=>a[0]*b[0]+a[1]*b[1];
+const aVec=(a,b)=>Math.acos(Math.max(-1,Math.min(1,vd(vn(a),vn(b)))));
+
+// Color interpolation for angle deviation: green (0 deg) -> orange -> red (90 deg)
+function aC(deg){
+  const t=Math.min(Math.abs(deg)/90,1);
+  if(t<0.5){const s=t*2;return`rgb(${0|39+193*s},${0|174-24*s},${0|96-84*s})`}
+  const s=(t-0.5)*2;return`rgb(${0|232-32*s},${0|150-95*s},${0|12+32*s})`
+}
+
+// ================================================================
+// Drawing helpers
+// ================================================================
+function arrow(x1,y1,x2,y2,col,lw,hs){
+  const dx=x2-x1,dy=y2-y1,len=Math.sqrt(dx*dx+dy*dy);
+  if(len<2)return;
+  fgCtx.strokeStyle=col;fgCtx.fillStyle=col;fgCtx.lineWidth=lw;
+  fgCtx.lineCap='round';fgCtx.lineJoin='round';
+  const sf=Math.max(0,1-hs/len);
+  fgCtx.beginPath();fgCtx.moveTo(x1,y1);fgCtx.lineTo(x1+dx*sf,y1+dy*sf);fgCtx.stroke();
+  const a=Math.atan2(dy,dx),ha=0.38;
+  fgCtx.beginPath();fgCtx.moveTo(x2,y2);
+  fgCtx.lineTo(x2-hs*Math.cos(a-ha),y2-hs*Math.sin(a-ha));
+  fgCtx.lineTo(x2-hs*.28*Math.cos(a),y2-hs*.28*Math.sin(a));
+  fgCtx.lineTo(x2-hs*Math.cos(a+ha),y2-hs*Math.sin(a+ha));
+  fgCtx.closePath();fgCtx.fill();
+}
+function dashArr(x1,y1,x2,y2,col,lw,hs){
+  const dx=x2-x1,dy=y2-y1,len=Math.sqrt(dx*dx+dy*dy);
+  if(len<2)return;
+  fgCtx.strokeStyle=col;fgCtx.fillStyle=col;fgCtx.lineWidth=lw;fgCtx.lineCap='round';
+  fgCtx.setLineDash([7,5]);
+  const sf=Math.max(0,1-hs/len);
+  fgCtx.beginPath();fgCtx.moveTo(x1,y1);fgCtx.lineTo(x1+dx*sf,y1+dy*sf);fgCtx.stroke();
+  fgCtx.setLineDash([]);
+  const a=Math.atan2(dy,dx),ha=0.38;
+  fgCtx.beginPath();fgCtx.moveTo(x2,y2);
+  fgCtx.lineTo(x2-hs*Math.cos(a-ha),y2-hs*Math.sin(a-ha));
+  fgCtx.lineTo(x2-hs*.28*Math.cos(a),y2-hs*.28*Math.sin(a));
+  fgCtx.lineTo(x2-hs*Math.cos(a+ha),y2-hs*Math.sin(a+ha));
+  fgCtx.closePath();fgCtx.fill();
+}
+
+// ================================================================
+// Render foreground (path + arrows)
+// ================================================================
+function render(){
+  if(!fgCtx)return;
+  fgCtx.save();fgCtx.scale(dpr,dpr);
+  fgCtx.clearRect(0,0,W,H);
+
+  if(odePath.length===0){fgCtx.restore();return;}
+
+  const gDir=[Math.cos(gradAngle),Math.sin(gradAngle)];
+  const arrowLen=(VX1-VX0)*0.045;
+
+  // Current continuous position
+  const curF=viewStepF;
+  const curInt=Math.round(curF); // nearest integer step for display
+  const curPos=lerpPos(curF);
+
+  // ── Full path line (faint shadow for visibility on colored bg) ──
+  fgCtx.strokeStyle='rgba(255,255,255,0.6)';fgCtx.lineWidth=4;
+  fgCtx.lineJoin='round';fgCtx.lineCap='round';
+  fgCtx.beginPath();
+  for(let s=0;s<=N_STEPS;s++){
+    const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
+  }
+  fgCtx.stroke();
+
+  // ── Full path (dim) ──
+  fgCtx.strokeStyle='rgba(24,50,126,0.2)';fgCtx.lineWidth=2;
+  fgCtx.beginPath();
+  for(let s=0;s<=N_STEPS;s++){
+    const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
+  }
+  fgCtx.stroke();
+
+  // ── Active path (up to current continuous position, strong) ──
+  {
+    const upTo=Math.floor(curF);
+    fgCtx.strokeStyle='rgba(24,50,126,0.5)';fgCtx.lineWidth=2.5;
+    fgCtx.beginPath();
+    for(let s=0;s<=upTo;s++){
+      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
+    }
+    // Interpolate to exact current position
+    const[cpx2,cpy2]=d2p(curPos[0],curPos[1]);
+    if(upTo<N_STEPS) fgCtx.lineTo(cpx2,cpy2);
+    fgCtx.stroke();
+  }
+
+  // ── Dots along path ──
+  for(let s=0;s<=N_STEPS;s++){
+    const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    const isEnd=(s===N_STEPS), isStart=(s===0);
+    const active=s<=curF;
+    // White halo
+    fgCtx.fillStyle='white';
+    fgCtx.beginPath();fgCtx.arc(px,py,(isEnd||isStart?5:3),0,6.2832);fgCtx.fill();
+    // Colored fill
+    fgCtx.fillStyle=(!active?'rgba(24,50,126,0.12)':(isStart?'rgba(24,50,126,0.4)':'rgba(24,50,126,0.25)'));
+    fgCtx.beginPath();fgCtx.arc(px,py,(isEnd||isStart?3.5:2),0,6.2832);fgCtx.fill();
+  }
+
+  // ── Current position indicator (interpolated) ──
+  {
+    const[cpx,cpy]=d2p(curPos[0],curPos[1]);
+    fgCtx.fillStyle='white';
+    fgCtx.beginPath();fgCtx.arc(cpx,cpy,7,0,6.2832);fgCtx.fill();
+    fgCtx.fillStyle='#18327E';
+    fgCtx.beginPath();fgCtx.arc(cpx,cpy,5,0,6.2832);fgCtx.fill();
+    fgCtx.strokeStyle='#18327E';fgCtx.lineWidth=2;
+    fgCtx.beginPath();fgCtx.arc(cpx,cpy,7,0,6.2832);fgCtx.stroke();
+  }
+
+  // ── x0 handle (dashed circle) ──
+  {
+    const[px,py]=d2p(x0[0],x0[1]);
+    fgCtx.strokeStyle='rgba(24,50,126,0.35)';fgCtx.lineWidth=1.5;fgCtx.setLineDash([4,4]);
+    fgCtx.beginPath();fgCtx.arc(px,py,14,0,6.2832);fgCtx.stroke();fgCtx.setLineDash([]);
+    // Label with white background
+    fgCtx.fillStyle='rgba(255,255,255,0.85)';
+    fgCtx.fillRect(px-10,py-28,20,14);
+    fgCtx.fillStyle='#18327E';fgCtx.font='bold 10px Arial';fgCtx.textAlign='center';fgCtx.textBaseline='bottom';
+    fgCtx.fillText('x\u2080',px,py-15);
+  }
+
+  // ── Labels for start/end ──
+  {
+    const[sx,sy]=d2p(odePath[0].pos[0],odePath[0].pos[1]);
+    // White background for readability
+    fgCtx.font='bold 11px Arial';
+    const tW1=fgCtx.measureText('t=0 (noise)').width;
+    fgCtx.fillStyle='rgba(255,255,255,0.8)';
+    fgCtx.fillRect(sx-tW1-14,sy-7,tW1+4,14);
+    fgCtx.fillStyle='rgba(24,50,126,0.6)';
+    fgCtx.textAlign='right';fgCtx.textBaseline='middle';
+    fgCtx.fillText('t=0 (noise)',sx-12,sy);
+
+    const[ex,ey]=d2p(odePath[N_STEPS].pos[0],odePath[N_STEPS].pos[1]);
+    const tW2=fgCtx.measureText('t=1 (data)').width;
+    fgCtx.fillStyle='rgba(255,255,255,0.8)';
+    fgCtx.fillRect(ex+10,ey-7,tW2+4,14);
+    fgCtx.fillStyle='rgba(24,50,126,0.6)';
+    fgCtx.textAlign='left';
+    fgCtx.fillText('t=1 (data)',ex+12,ey);
+  }
+
+  // ── Half-space visualization at current position ──
+  const[cpx,cpy]=d2p(curPos[0],curPos[1]);
+  const sA=-gradAngle; // screen angle (y is flipped)
+  const perpA=sA+Math.PI/2;
+  const R=Math.max(W,H)*1.5;
+  const pA1=[cpx+Math.cos(perpA)*R,cpy+Math.sin(perpA)*R];
+  const pA2=[cpx-Math.cos(perpA)*R,cpy-Math.sin(perpA)*R];
+
+  // Green half-space (same side as gradient)
+  fgCtx.fillStyle='rgba(39,174,96,0.04)';
+  fgCtx.beginPath();fgCtx.moveTo(pA1[0],pA1[1]);fgCtx.lineTo(pA2[0],pA2[1]);
+  fgCtx.lineTo(pA2[0]+Math.cos(sA)*R*2,pA2[1]+Math.sin(sA)*R*2);
+  fgCtx.lineTo(pA1[0]+Math.cos(sA)*R*2,pA1[1]+Math.sin(sA)*R*2);fgCtx.closePath();fgCtx.fill();
+  // Red half-space (opposite side)
+  fgCtx.fillStyle='rgba(200,55,44,0.02)';
+  fgCtx.beginPath();fgCtx.moveTo(pA1[0],pA1[1]);fgCtx.lineTo(pA2[0],pA2[1]);
+  fgCtx.lineTo(pA2[0]-Math.cos(sA)*R*2,pA2[1]-Math.sin(sA)*R*2);
+  fgCtx.lineTo(pA1[0]-Math.cos(sA)*R*2,pA1[1]-Math.sin(sA)*R*2);fgCtx.closePath();fgCtx.fill();
+  // Dividing line
+  fgCtx.strokeStyle='rgba(0,0,0,0.08)';fgCtx.lineWidth=1;fgCtx.setLineDash([5,5]);
+  fgCtx.beginPath();fgCtx.moveTo(pA1[0],pA1[1]);fgCtx.lineTo(pA2[0],pA2[1]);fgCtx.stroke();fgCtx.setLineDash([]);
+
+  // ── Gradient arrows at current interpolated position ──
+  const curJ=lerpJac(curF), curJT=m2T(curJ);
+  const eG=m2v(curJT,gDir); // exact backprop gradient
+  const eDir=vn(eG);
+  const eMag=vl(eG);
+  const aDeg=aVec(eG,gDir)*180/Math.PI;
+
+  const showE=(mode==='exact'||mode==='both');
+  const showC=(mode==='copy'||mode==='both');
+  const isAtEnd=(curF>=N_STEPS-0.01);
+
+  // ── Trail arrows at ALL discrete steps along the chain ──
+  for(let s=0;s<=N_STEPS;s++){
+    // Skip if this is very close to the current position (hero arrow covers it)
+    if(Math.abs(s-curF)<0.5) continue;
+
+    const[ppx,ppy]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    const pJ=odeJacs[s], pJT=m2T(pJ);
+    const pG=m2v(pJT,gDir);
+    const pDir=vn(pG);
+    const pMag=vl(pG);
+    const pDeg=aVec(pG,gDir)*180/Math.PI;
+    const dLen=arrowLen*Math.min(Math.max(pMag,0.4),2.0);
+
+    // Opacity based on distance from current step: closer = more visible
+    const dist=Math.abs(s-curF);
+    const baseAlpha=Math.max(0.08, 0.35-dist*0.015);
+
+    if(showE){
+      const tx=odePath[s].pos[0]+pDir[0]*dLen, ty=odePath[s].pos[1]+pDir[1]*dLen;
+      const[tpx,tpy]=d2p(tx,ty);
+      fgCtx.globalAlpha=baseAlpha;
+      arrow(ppx,ppy,tpx,tpy,s===N_STEPS?'#C8372C':aC(pDeg),1.8,7);
+      fgCtx.globalAlpha=1;
+    }
+    if(showC&&mode==='both'){
+      const tx=odePath[s].pos[0]+gDir[0]*arrowLen, ty=odePath[s].pos[1]+gDir[1]*arrowLen;
+      const[tpx,tpy]=d2p(tx,ty);
+      fgCtx.globalAlpha=baseAlpha*0.5;
+      dashArr(ppx,ppy,tpx,tpy,'rgba(200,55,44,0.5)',1.3,5);
+      fgCtx.globalAlpha=1;
+    }
+  }
+
+  // ── Current step: hero arrows ──
+  const bigLen=arrowLen*1.5;
+  const bigDataLen=bigLen*Math.min(Math.max(eMag,0.4),2.2);
+
+  if(showE){
+    const tx=curPos[0]+eDir[0]*bigDataLen;
+    const ty=curPos[1]+eDir[1]*bigDataLen;
+    const[tpx,tpy]=d2p(tx,ty);
+    const col=isAtEnd?'#C8372C':aC(aDeg);
+    // White shadow for visibility
+    fgCtx.globalAlpha=0.6;
+    arrow(cpx,cpy,tpx,tpy,'white',6,14);
+    fgCtx.globalAlpha=1;
+    arrow(cpx,cpy,tpx,tpy,col,3.5,12);
+    if(!isAtEnd){
+      fgCtx.fillStyle='rgba(255,255,255,0.8)';
+      const label=`${aDeg.toFixed(1)}\u00B0`;
+      const tw=fgCtx.measureText(label).width;
+      fgCtx.fillRect(tpx+3,tpy-16,tw+4,14);
+      fgCtx.fillStyle=col;fgCtx.font='bold 12px Arial';fgCtx.textAlign='left';fgCtx.textBaseline='bottom';
+      fgCtx.fillText(label,tpx+5,tpy-3);
+    }
+    // Arrow label
+    const lbl=isAtEnd?'\u2207R':'J\u1D40\u00B7\u2207R';
+    fgCtx.font='bold 11px Arial';
+    const tw2=fgCtx.measureText(lbl).width;
+    fgCtx.fillStyle='rgba(255,255,255,0.8)';
+    fgCtx.fillRect(tpx+3,tpy+2,tw2+4,14);
+    fgCtx.fillStyle=col;fgCtx.textAlign='left';fgCtx.textBaseline='top';
+    fgCtx.fillText(lbl,tpx+5,tpy+3);
+  }
+
+  if(showC&&!(isAtEnd&&mode==='both')){
+    const tx=curPos[0]+gDir[0]*bigLen;
+    const ty=curPos[1]+gDir[1]*bigLen;
+    const[tpx,tpy]=d2p(tx,ty);
+    if(mode==='both'){
+      fgCtx.globalAlpha=0.5;
+      dashArr(cpx,cpy,tpx,tpy,'white',5,12);
+      fgCtx.globalAlpha=1;
+      dashArr(cpx,cpy,tpx,tpy,'rgba(200,55,44,0.7)',2.5,10);
+      fgCtx.fillStyle='rgba(255,255,255,0.8)';
+      const lbl='copied \u2207R';
+      fgCtx.font='bold 11px Arial';
+      const tw=fgCtx.measureText(lbl).width;
+      fgCtx.fillRect(tpx-tw-7,tpy+3,tw+4,14);
+      fgCtx.fillStyle='rgba(200,55,44,0.7)';
+      fgCtx.textAlign='right';fgCtx.textBaseline='top';
+      fgCtx.fillText(lbl,tpx-5,tpy+4);
+    } else {
+      const col=isAtEnd?'#C8372C':'#27ae60';
+      fgCtx.globalAlpha=0.5;
+      arrow(cpx,cpy,tpx,tpy,'white',6,14);
+      fgCtx.globalAlpha=1;
+      arrow(cpx,cpy,tpx,tpy,col,3.5,12);
+      const lbl=isAtEnd?'\u2207R':'copied \u2207R';
+      fgCtx.font='bold 11px Arial';
+      const tw=fgCtx.measureText(lbl).width;
+      fgCtx.fillStyle='rgba(255,255,255,0.8)';
+      fgCtx.fillRect(tpx+3,tpy+2,tw+4,14);
+      fgCtx.fillStyle=col;fgCtx.textAlign='left';fgCtx.textBaseline='top';
+      fgCtx.fillText(lbl,tpx+5,tpy+3);
+    }
+  }
+
+  // ── Drag hint for gradient rotation at endpoint ──
+  if(isAtEnd){
+    const[epx,epy]=d2p(odePath[N_STEPS].pos[0],odePath[N_STEPS].pos[1]);
+    fgCtx.strokeStyle='rgba(200,55,44,0.2)';fgCtx.lineWidth=1.5;fgCtx.setLineDash([4,4]);
+    fgCtx.beginPath();fgCtx.arc(epx,epy,28,0,6.2832);fgCtx.stroke();fgCtx.setLineDash([]);
+  }
+
+  fgCtx.restore();
+
+  // Status readout
+  const ro=document.getElementById('ro');
+  const dispStep=curF.toFixed(1);
+  if(isAtEnd){
+    ro.innerHTML='At data endpoint: <span style="color:#C8372C">\u2207R</span> (drag near endpoint to rotate)';
+  } else {
+    if(mode==='exact'||mode==='both'){
+      const qual=aDeg<45?'<span style="color:#27ae60">well within</span>':aDeg<90?'<span style="color:#E8960C">approaching</span>':'<span style="color:#C8372C">beyond</span>';
+      ro.innerHTML='Step '+dispStep+'/'+N_STEPS+': deviation = <span style="color:'+aC(aDeg)+'">'+aDeg.toFixed(1)+'\u00B0</span> \u2014 '+qual+' the 90\u00B0 half-space';
+    } else {
+      ro.innerHTML='Step '+dispStep+'/'+N_STEPS+': copied gradient = <span style="color:#27ae60">0\u00B0</span> deviation (always the clean \u2207R)';
+    }
+  }
+}
+
+// ================================================================
+// Interaction (with rAF throttling for smooth dragging)
+// ================================================================
+let rafPending=false;
+function cXY(e){
+  const r=fgCanvas.getBoundingClientRect();
+  const cx=(e.touches?e.touches[0].clientX:e.clientX);
+  const cy=(e.touches?e.touches[0].clientY:e.clientY);
+  return[(cx-r.left)*W/r.width,(cy-r.top)*H/r.height];
+}
+function onDown(e){
+  const[mx,my]=cXY(e);
+  // Check if near endpoint (for gradient rotation)
+  if(odePath.length>0){
+    const[epx,epy]=d2p(odePath[N_STEPS].pos[0],odePath[N_STEPS].pos[1]);
+    if(Math.sqrt((mx-epx)**2+(my-epy)**2)<40){
+      e.preventDefault();isDrag=true;dragTarget='grad';onMove(e);return;
+    }
+  }
+  // Otherwise, move x0
+  e.preventDefault();isDrag=true;dragTarget='x0';
+  const[dx,dy]=p2d(mx,my);
+  x0=[dx,dy];
+  integrateODE();render();
+}
+function onMove(e){
+  if(!isDrag)return;e.preventDefault();
+  // Capture coordinates eagerly (event properties may be invalidated after handler returns)
+  const[mx,my]=cXY(e);
+  if(rafPending)return; // throttle to animation frames
+  rafPending=true;
+  requestAnimationFrame(()=>{
+    rafPending=false;
+    if(!isDrag)return;
+    if(dragTarget==='grad'){
+      const[epx,epy]=d2p(odePath[N_STEPS].pos[0],odePath[N_STEPS].pos[1]);
+      const ddx=mx-epx,ddy=my-epy;
+      if(Math.abs(ddx)>2||Math.abs(ddy)>2)gradAngle=Math.atan2(-ddy,ddx);
+      render();
+    } else {
+      const[ddx,ddy]=p2d(mx,my);
+      x0=[ddx,ddy];
+      integrateODE();render();
+    }
+  });
+}
+function onUp(){isDrag=false;dragTarget=null;}
+
+// ================================================================
+// Controls
+// ================================================================
+function setMode(m){
+  mode=m;
+  document.getElementById('bE').classList.toggle('on',m==='exact');
+  document.getElementById('bC').classList.toggle('on',m==='copy');
+  document.getElementById('bB').classList.toggle('on',m==='both');
+  render();
+}
+function togglePlay(){
+  playing=!playing;
+  const btn=document.getElementById('playBtn');
+  if(playing){
+    btn.innerHTML='&#9646;&#9646;';btn.style.background='#C8372C';btn.style.color='white';
+    viewStepF=N_STEPS;playLast=performance.now();playRAF();
+  } else {
+    btn.innerHTML='&#9654;';btn.style.background='white';btn.style.color='#C8372C';
+  }
+}
+let playLast=0;
+function playRAF(){
+  if(!playing)return;
+  requestAnimationFrame((now)=>{
+    if(!playing)return;
+    const dt=(now-playLast)/1000; // seconds
+    playLast=now;
+    viewStepF-=dt*4; // traverse chain in ~5 seconds
+    if(viewStepF<0){
+      viewStepF=N_STEPS;playing=false;
+      document.getElementById('playBtn').innerHTML='&#9654;';
+      document.getElementById('playBtn').style.background='white';
+      document.getElementById('playBtn').style.color='#C8372C';
+    }
+    syncSlider();
+    render();
+    if(playing) playRAF();
+  });
+}
+function syncSlider(){
+  const slider=document.getElementById('stepSlider');
+  slider.value=Math.round(viewStepF/N_STEPS*SLIDER_RES);
+  document.getElementById('stepVal').textContent=viewStepF.toFixed(1);
+}
+
+// ================================================================
+// Init
+// ================================================================
+function initFg(){
+  fgCanvas=document.getElementById('fg');
+  fgCtx=fgCanvas.getContext('2d');
+  dpr=window.devicePixelRatio||1;
+  const box=document.getElementById('box');
+  const r=box.getBoundingClientRect();
+  W=r.width;H=r.height;
+  fgCanvas.width=W*dpr;fgCanvas.height=H*dpr;
+  fgCanvas.style.width=W+'px';fgCanvas.style.height=H+'px';
+}
+
+function setup(){
+  // Phase 1: render vector tree background (fast, resolution-independent)
+  renderVectorTree();
+  document.getElementById('loadMsg').style.display='none';
+
+  // Phase 2: init foreground and integrate
+  initFg();
+  integrateODE();
+  render();
+
+  // Events
+  fgCanvas.addEventListener('mousedown',onDown);
+  document.addEventListener('mousemove',onMove);
+  document.addEventListener('mouseup',onUp);
+  fgCanvas.addEventListener('touchstart',onDown,{passive:false});
+  document.addEventListener('touchmove',onMove,{passive:false});
+  document.addEventListener('touchend',onUp);
+
+  document.getElementById('stepSlider').addEventListener('input',function(e){
+    viewStepF=parseInt(e.target.value)/SLIDER_RES*N_STEPS;
+    document.getElementById('stepVal').textContent=viewStepF.toFixed(1);
+    if(playing){playing=false;
+      document.getElementById('playBtn').innerHTML='&#9654;';
+      document.getElementById('playBtn').style.background='white';
+      document.getElementById('playBtn').style.color='#C8372C';
+    }
+    render();
+  });
+
+  let rt;
+  window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{renderVectorTree();initFg();render();},200);});
+}
+
+// Defer heavy compute to after first paint
+requestAnimationFrame(()=>setTimeout(setup,50));
+</script>
+</body>
+</html>
