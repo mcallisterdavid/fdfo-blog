@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trajectories — Flow-GRPO vs FDFO</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Helvetica Neue',Arial,sans-serif;background:#FAF8F5;color:#050532;overflow-x:hidden}
+.wrap{max-width:900px;margin:0 auto;padding:16px}
+h3{text-align:center;font:bold 16px/1.4 'Helvetica Neue',Arial,sans-serif;color:#050532;margin-bottom:6px}
+.subtitle{text-align:center;font:12px/1.4 'Helvetica Neue',Arial,sans-serif;color:#656C75;margin-bottom:12px}
+.panels{display:flex;gap:12px;justify-content:center}
+.panel{flex:1;min-width:0;max-width:440px}
+.panel-label{text-align:center;font:bold 13px/1.4 'Helvetica Neue',Arial,sans-serif;margin-bottom:6px}
+.panel-label.grpo{color:#732424}
+.panel-label.fdfo{color:#050532}
+canvas{width:100%;aspect-ratio:1/1;border-radius:10px;border:1.5px solid #e0ddd8;display:block;background:#FAF8F5}
+.controls{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px;flex-wrap:wrap}
+.play-btn{width:34px;height:34px;border-radius:50%;border:2px solid #732424;background:#FAF8F5;color:#732424;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s,color .15s}
+.play-btn.playing{background:#732424;color:#FAF8F5}
+.play-btn:hover{opacity:.85}
+.controls label{font:bold 12px/1 'Helvetica Neue',Arial,sans-serif;color:#656C75}
+input[type=range]{width:200px;height:4px;border-radius:4px;background:#ddd;outline:none;-webkit-appearance:none;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#050532;cursor:pointer}
+input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#050532;cursor:pointer;border:none}
+.toggles{display:flex;gap:6px;justify-content:center;margin-top:10px;flex-wrap:wrap}
+.tog{padding:5px 14px;font:bold 11px/1 'Helvetica Neue',Arial,sans-serif;border:1.5px solid #050532;border-radius:5px;cursor:pointer;background:#FAF8F5;color:#050532;user-select:none;transition:background .15s,color .15s}
+.tog.on{background:#050532;color:#FAF8F5}
+.tog:hover{opacity:.85}
+.caption{text-align:center;margin-top:12px;color:#656C75;font:12px/1.6 'Helvetica Neue',Arial,sans-serif;max-width:740px;margin-left:auto;margin-right:auto}
+@media(max-width:700px){.panels{flex-direction:column;align-items:center}.panel{max-width:100%}input[type=range]{width:140px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h3>Sampling Trajectories</h3>
+  <div class="subtitle">How Flow-GRPO and FDFO navigate toward high-reward regions</div>
+  <div class="panels">
+    <div class="panel">
+      <div class="panel-label grpo">Flow-GRPO (Backprop)</div>
+      <canvas id="cvLeft"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-label fdfo">FDFO (Finite Difference)</div>
+      <canvas id="cvRight"></canvas>
+    </div>
+  </div>
+  <div class="controls">
+    <button class="play-btn" id="playBtn" title="Animate">&#9654;</button>
+    <label>Time:</label>
+    <input type="range" id="timeSlider" min="0" max="100" value="100">
+    <span id="timeLabel" style="font:bold 12px/1 'Helvetica Neue',Arial,sans-serif;color:#050532;min-width:40px">t=1.0</span>
+  </div>
+  <div class="toggles">
+    <div class="tog on" data-layer="heatmap">Reward</div>
+    <div class="tog on" data-layer="trajectories">Trajectories</div>
+    <div class="tog on" data-layer="arrows">Velocity</div>
+  </div>
+  <div class="caption">
+    <b>Left:</b> Flow-GRPO backpropagates through stochastic sampling — each trajectory has independent noise,
+    and gradients degrade through the chain.
+    <b>Right:</b> FDFO uses paired trajectories (base + perturbed) from the <em>same</em> noise to estimate gradient direction via finite differences.
+  </div>
+</div>
+
+<script>
+// ==========================================================
+// Seeded PRNG
+// ==========================================================
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+
+const rng = mulberry32(314159);
+function randn() {
+  const u = rng(), v = rng();
+  return Math.sqrt(-2 * Math.log(u + 1e-12)) * Math.cos(6.2832 * v);
+}
+
+// ==========================================================
+// Reward landscape — two Gaussian peaks
+// ==========================================================
+const peaks = [
+  { cx: 0.35, cy: 0.7, sx: 0.12, sy: 0.10, w: 1.0 },
+  { cx: 0.7,  cy: 0.75, sx: 0.10, sy: 0.13, w: 0.7 },
+];
+function reward(x, y) {
+  let r = 0;
+  for (const p of peaks) {
+    const dx = (x - p.cx) / p.sx, dy = (y - p.cy) / p.sy;
+    r += p.w * Math.exp(-0.5 * (dx * dx + dy * dy));
+  }
+  return r;
+}
+
+// Precompute reward grid for heatmap
+const gridN = 64;
+const rewardGrid = [];
+let maxR = 0;
+for (let j = 0; j < gridN; j++) {
+  rewardGrid[j] = [];
+  for (let i = 0; i < gridN; i++) {
+    const x = i / (gridN - 1), y = j / (gridN - 1);
+    const r = reward(x, y);
+    rewardGrid[j][i] = r;
+    if (r > maxR) maxR = r;
+  }
+}
+
+// ==========================================================
+// Generate trajectories
+// ==========================================================
+const T = 20; // steps
+const nTraj = 6;
+
+// Simple flow: noise at t=0 → attracted toward peaks at t=1
+// x_{t+1} = x_t + dt * v(x_t, t) + noise
+function velocity(x, y, t) {
+  // Blend: drift toward weighted average of peaks, strength increases with t
+  let wx = 0, wy = 0, wt = 0;
+  for (const p of peaks) {
+    const r = reward(x, y) + 0.1;
+    const w = p.w * Math.exp(-2 * ((x - p.cx) ** 2 + (y - p.cy) ** 2));
+    wx += w * (p.cx - x);
+    wy += w * (p.cy - y);
+    wt += w;
+  }
+  if (wt > 0.001) { wx /= wt; wy /= wt; }
+  const strength = 0.5 + 2.0 * t;
+  return [wx * strength, wy * strength];
+}
+
+function generateTrajectories(noiseSeed, addPerturbation) {
+  const localRng = mulberry32(noiseSeed);
+  function localRandn() {
+    const u = localRng(), v = localRng();
+    return Math.sqrt(-2 * Math.log(u + 1e-12)) * Math.cos(6.2832 * v);
+  }
+
+  const trajs = [];
+  for (let k = 0; k < nTraj; k++) {
+    const pts = [];
+    // Start from random noise position in bottom region
+    let x = 0.15 + localRandn() * 0.22;
+    let y = 0.12 + Math.abs(localRandn()) * 0.08;
+    x = Math.max(0.05, Math.min(0.95, x));
+    y = Math.max(0.05, Math.min(0.3, y));
+    pts.push([x, y]);
+
+    const dt = 1.0 / T;
+    const noiseScale = 0.015;
+
+    for (let s = 0; s < T; s++) {
+      const t = s / T;
+      const [vx, vy] = velocity(x, y, t);
+      x += vx * dt + localRandn() * noiseScale * (1 - t * 0.7);
+      y += vy * dt + localRandn() * noiseScale * (1 - t * 0.7);
+      if (addPerturbation && s === Math.floor(T * 0.3)) {
+        // Small perturbation at 30% of the way
+        x += 0.03;
+        y += 0.02;
+      }
+      x = Math.max(0.02, Math.min(0.98, x));
+      y = Math.max(0.02, Math.min(0.98, y));
+      pts.push([x, y]);
+    }
+    trajs.push(pts);
+  }
+  return trajs;
+}
+
+// Flow-GRPO: independent trajectories
+const grpoTrajs = generateTrajectories(42, false);
+
+// FDFO: paired trajectories (base + perturbed from same noise)
+const fdfoBase = generateTrajectories(77, false);
+const fdfoChurned = generateTrajectories(77, true);
+
+// ==========================================================
+// Layers
+// ==========================================================
+let showHeatmap = true, showTrajectories = true, showArrows = true;
+
+// ==========================================================
+// Drawing
+// ==========================================================
+function setupCanvas(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: rect.width, h: rect.height };
+}
+
+function drawHeatmap(ctx, w, h) {
+  const cellW = w / gridN, cellH = h / gridN;
+  for (let j = 0; j < gridN; j++) {
+    for (let i = 0; i < gridN; i++) {
+      const r = rewardGrid[j][i] / maxR;
+      // Cream → soft green gradient
+      const red = Math.round(250 - r * 80);
+      const green = Math.round(248 - r * 20);
+      const blue = Math.round(245 - r * 100);
+      ctx.fillStyle = `rgb(${red},${green},${blue})`;
+      // Flip y so bottom is y=0
+      ctx.fillRect(i * cellW, (gridN - 1 - j) * cellH, cellW + 0.5, cellH + 0.5);
+    }
+  }
+  // Contour rings around peaks
+  ctx.strokeStyle = 'rgba(5,5,50,0.12)';
+  ctx.lineWidth = 0.8;
+  for (const p of peaks) {
+    for (let ring = 1; ring <= 3; ring++) {
+      const rx = p.sx * ring * 1.1 * w;
+      const ry = p.sy * ring * 1.1 * h;
+      ctx.beginPath();
+      ctx.ellipse(p.cx * w, (1 - p.cy) * h, rx, ry, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+}
+
+function drawArrow(ctx, x1, y1, x2, y2, color, width) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 1) return;
+  const headLen = Math.min(5, len * 0.4);
+  const angle = Math.atan2(dy, dx);
+
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2 - Math.cos(angle) * headLen * 0.5, y2 - Math.sin(angle) * headLen * 0.5);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(x2, y2);
+  ctx.lineTo(x2 - Math.cos(angle - 0.4) * headLen, y2 - Math.sin(angle - 0.4) * headLen);
+  ctx.lineTo(x2 - Math.cos(angle + 0.4) * headLen, y2 - Math.sin(angle + 0.4) * headLen);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawTrajectories(ctx, w, h, trajs, tFrac, colors, dashed, pairTrajs) {
+  const stepsToShow = Math.floor(tFrac * T);
+
+  for (let k = 0; k < trajs.length; k++) {
+    const pts = trajs[k];
+    const color = colors[k % colors.length];
+
+    if (showTrajectories) {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      if (dashed) ctx.setLineDash([4, 3]);
+      else ctx.setLineDash([]);
+
+      ctx.beginPath();
+      for (let s = 0; s <= stepsToShow && s < pts.length; s++) {
+        const px = pts[s][0] * w;
+        const py = (1 - pts[s][1]) * h;
+        if (s === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Start dot
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(pts[0][0] * w, (1 - pts[0][1]) * h, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Current position dot
+      if (stepsToShow < pts.length) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(pts[stepsToShow][0] * w, (1 - pts[stepsToShow][1]) * h, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#FAF8F5';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
+
+    // Velocity arrows along trajectory
+    if (showArrows && stepsToShow > 0) {
+      const step = Math.max(1, Math.floor(T / 5));
+      for (let s = step; s <= stepsToShow && s < pts.length; s += step) {
+        const prev = pts[s - 1];
+        const cur = pts[s];
+        const dx = (cur[0] - prev[0]) * w * 2.5;
+        const dy = -(cur[1] - prev[1]) * h * 2.5;
+        const px = cur[0] * w;
+        const py = (1 - cur[1]) * h;
+        drawArrow(ctx, px, py, px + dx, py + dy, color, 1.2);
+      }
+    }
+
+    // For FDFO pairs: draw connecting lines between base and churned
+    if (pairTrajs && showTrajectories) {
+      const pair = pairTrajs[k];
+      if (pair && stepsToShow > 0) {
+        ctx.strokeStyle = 'rgba(171,128,100,0.35)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 2]);
+        const s = Math.min(stepsToShow, pair.length - 1);
+        ctx.beginPath();
+        ctx.moveTo(pts[s][0] * w, (1 - pts[s][1]) * h);
+        ctx.lineTo(pair[s][0] * w, (1 - pair[s][1]) * h);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Delta arrow showing finite difference direction
+        if (showArrows) {
+          const dx = (pair[s][0] - pts[s][0]) * w;
+          const dy = -(pair[s][1] - pts[s][1]) * h;
+          const midX = pts[s][0] * w;
+          const midY = (1 - pts[s][1]) * h;
+          drawArrow(ctx, midX, midY, midX + dx, midY + dy, '#AB8064', 1.5);
+        }
+      }
+    }
+  }
+}
+
+function drawPanel(canvas, type, tFrac) {
+  const { ctx, w, h } = setupCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+
+  if (showHeatmap) {
+    drawHeatmap(ctx, w, h);
+  }
+
+  if (type === 'grpo') {
+    // Flow-GRPO: independent trajectories, colored with degradation palette
+    const colors = ['#050532', '#732424', '#656C75', '#AB8064', '#3a3a6e', '#8a4040'];
+    drawTrajectories(ctx, w, h, grpoTrajs, tFrac, colors, false, null);
+  } else {
+    // FDFO: paired base (solid) + churned (dashed)
+    const baseColors = ['#050532', '#050532', '#050532', '#050532', '#050532', '#050532'];
+    const churnColors = ['#AB8064', '#AB8064', '#AB8064', '#AB8064', '#AB8064', '#AB8064'];
+
+    // Draw base trajectories
+    drawTrajectories(ctx, w, h, fdfoBase, tFrac, baseColors, false, fdfoChurned);
+
+    // Draw churned trajectories (dashed)
+    drawTrajectories(ctx, w, h, fdfoChurned, tFrac, churnColors, true, null);
+  }
+
+  // Labels for peaks
+  ctx.fillStyle = 'rgba(5,5,50,0.5)';
+  ctx.font = 'bold 10px "Helvetica Neue",Arial,sans-serif';
+  ctx.textAlign = 'center';
+  for (const p of peaks) {
+    ctx.fillText('high R', p.cx * w, (1 - p.cy) * h - 8);
+  }
+
+  // "noise" label at bottom
+  ctx.fillStyle = '#656C75';
+  ctx.font = '10px "Helvetica Neue",Arial,sans-serif';
+  ctx.fillText('x\u2080 ~ noise', w * 0.3, h - 8);
+}
+
+// ==========================================================
+// State
+// ==========================================================
+let tFrac = 1.0;
+let playing = false, animId = null, lastTime = 0;
+
+function render() {
+  drawPanel(document.getElementById('cvLeft'), 'grpo', tFrac);
+  drawPanel(document.getElementById('cvRight'), 'fdfo', tFrac);
+  document.getElementById('timeLabel').textContent = `t=${tFrac.toFixed(2)}`;
+}
+
+// ==========================================================
+// Controls
+// ==========================================================
+const slider = document.getElementById('timeSlider');
+slider.addEventListener('input', () => {
+  tFrac = parseInt(slider.value) / 100;
+  render();
+});
+
+const playBtn = document.getElementById('playBtn');
+playBtn.addEventListener('click', () => {
+  playing = !playing;
+  playBtn.classList.toggle('playing', playing);
+  playBtn.innerHTML = playing ? '&#9646;&#9646;' : '&#9654;';
+  if (playing) {
+    tFrac = 0;
+    slider.value = 0;
+    lastTime = performance.now();
+    animId = requestAnimationFrame(animate);
+  } else if (animId) {
+    cancelAnimationFrame(animId);
+    animId = null;
+  }
+});
+
+function animate(ts) {
+  if (!playing) return;
+  const dt = ts - lastTime;
+  if (dt > 50) {
+    lastTime = ts;
+    tFrac = Math.min(1, tFrac + 0.02);
+    slider.value = Math.round(tFrac * 100);
+    render();
+    if (tFrac >= 1) {
+      playing = false;
+      playBtn.classList.remove('playing');
+      playBtn.innerHTML = '&#9654;';
+      return;
+    }
+  }
+  animId = requestAnimationFrame(animate);
+}
+
+// Layer toggles
+document.querySelectorAll('.tog').forEach(tog => {
+  tog.addEventListener('click', () => {
+    tog.classList.toggle('on');
+    const layer = tog.dataset.layer;
+    if (layer === 'heatmap') showHeatmap = tog.classList.contains('on');
+    else if (layer === 'trajectories') showTrajectories = tog.classList.contains('on');
+    else if (layer === 'arrows') showArrows = tog.classList.contains('on');
+    render();
+  });
+});
+
+window.addEventListener('resize', render);
+render();
+</script>
+</body>
+</html>

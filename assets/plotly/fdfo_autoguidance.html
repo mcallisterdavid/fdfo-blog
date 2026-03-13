@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distribution Sharpening via FDFO</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background-color: #FAF8F5;
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            color: #050532;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .viz-container {
+            width: 100%;
+            max-width: 640px;
+            position: relative;
+        }
+        canvas {
+            width: 100%;
+            display: block;
+            border-radius: 8px;
+        }
+        .label-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 6px;
+            padding: 0 4px;
+        }
+        .label-left, .label-right {
+            font-size: 13px;
+            font-weight: 600;
+            transition: opacity 0.3s;
+        }
+        .label-left { color: #656C75; }
+        .label-right { color: #732424; }
+        .slider-container {
+            width: 100%;
+            margin-top: 14px;
+            text-align: center;
+        }
+        .slider-container label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            color: #050532;
+        }
+        .slider-container label span {
+            color: #732424;
+            font-variant-numeric: tabular-nums;
+        }
+        input[type="range"] {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 5px;
+            border-radius: 5px;
+            background: linear-gradient(to right, #656C75, #732424);
+            outline: none;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #050532;
+            cursor: pointer;
+            border: 2px solid #FAF8F5;
+            box-shadow: 0 1px 4px rgba(5,5,50,0.3);
+        }
+        input[type="range"]::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #050532;
+            cursor: pointer;
+            border: 2px solid #FAF8F5;
+            box-shadow: 0 1px 4px rgba(5,5,50,0.3);
+        }
+        .caption {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #656C75;
+            text-align: center;
+            line-height: 1.4;
+        }
+        @media (max-width: 600px) {
+            body { padding: 10px; }
+            .label-left, .label-right { font-size: 11px; }
+            .slider-container label { font-size: 12px; }
+            input[type="range"]::-webkit-slider-thumb { width: 26px; height: 26px; }
+            input[type="range"]::-moz-range-thumb { width: 26px; height: 26px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="viz-container">
+        <div class="label-row">
+            <div class="label-left" id="labelBase">Base Model</div>
+            <div class="label-right" id="labelFDFO">After FDFO</div>
+        </div>
+        <canvas id="canvas"></canvas>
+        <div class="slider-container">
+            <label>Guidance Strength: <span id="sliderVal">0.00</span></label>
+            <input type="range" id="guidanceSlider" min="0" max="1" step="0.01" value="0">
+        </div>
+        <div class="caption">
+            The base model (diffuse) envelops the true data manifold. As guidance strength increases, the distribution contracts toward sharp, high-quality modes.
+        </div>
+    </div>
+
+    <script>
+    (function() {
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const slider = document.getElementById('guidanceSlider');
+        const sliderVal = document.getElementById('sliderVal');
+        const labelBase = document.getElementById('labelBase');
+        const labelFDFO = document.getElementById('labelFDFO');
+
+        // High-DPI
+        const dpr = window.devicePixelRatio || 1;
+        const W = 640, H = 480;
+        canvas.width = W * dpr;
+        canvas.height = H * dpr;
+        canvas.style.width = '100%';
+        canvas.style.maxWidth = W + 'px';
+        canvas.style.height = 'auto';
+        canvas.style.aspectRatio = W + '/' + H;
+        ctx.scale(dpr, dpr);
+
+        // Palette
+        const NAVY = [5, 5, 50];
+        const BURGUNDY = [115, 36, 36];
+        const TERRACOTTA = [171, 128, 100];
+        const CREAM = [250, 248, 245];
+        const SLATE = [101, 108, 117];
+
+        // Mode centers for 2D Gaussian mixture (4 modes)
+        const modes = [
+            { cx: -1.2, cy:  1.0 },
+            { cx:  1.3, cy:  0.8 },
+            { cx: -0.5, cy: -1.1 },
+            { cx:  1.0, cy: -0.9 },
+        ];
+
+        // Std deviations
+        const sigmaBase = 0.65;   // broad base model
+        const sigmaTrue = 0.18;   // tight true data
+
+        // Grid
+        const xMin = -3, xMax = 3, yMin = -3, yMax = 3;
+        const gridN = 200;
+        const dx = (xMax - xMin) / gridN;
+        const dy = (yMax - yMin) / gridN;
+
+        // Precompute density grids for base and true
+        const densBase = new Float32Array(gridN * gridN);
+        const densTrue = new Float32Array(gridN * gridN);
+
+        function gauss2D(x, y, cx, cy, sigma) {
+            const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+            return Math.exp(-r2 / (2 * sigma * sigma));
+        }
+
+        for (let iy = 0; iy < gridN; iy++) {
+            const y = yMin + (iy + 0.5) * dy;
+            for (let ix = 0; ix < gridN; ix++) {
+                const x = xMin + (ix + 0.5) * dx;
+                let vBase = 0, vTrue = 0;
+                for (const m of modes) {
+                    vBase += gauss2D(x, y, m.cx, m.cy, sigmaBase);
+                    vTrue += gauss2D(x, y, m.cx, m.cy, sigmaTrue);
+                }
+                const idx = iy * gridN + ix;
+                densBase[idx] = vBase;
+                densTrue[idx] = vTrue;
+            }
+        }
+
+        // Normalize
+        let maxBase = 0, maxTrue = 0;
+        for (let i = 0; i < densBase.length; i++) {
+            if (densBase[i] > maxBase) maxBase = densBase[i];
+            if (densTrue[i] > maxTrue) maxTrue = densTrue[i];
+        }
+        for (let i = 0; i < densBase.length; i++) {
+            densBase[i] /= maxBase;
+            densTrue[i] /= maxTrue;
+        }
+
+        // Color interpolation
+        function lerpColor(c1, c2, t) {
+            return [
+                c1[0] + (c2[0] - c1[0]) * t,
+                c1[1] + (c2[1] - c1[1]) * t,
+                c1[2] + (c2[2] - c1[2]) * t,
+            ];
+        }
+
+        // Custom colormap: cream -> terracotta -> burgundy -> navy
+        function densityColor(v, alpha) {
+            // v in [0,1]
+            let r, g, b;
+            if (v < 0.33) {
+                const t = v / 0.33;
+                [r, g, b] = lerpColor(CREAM, TERRACOTTA, t);
+            } else if (v < 0.66) {
+                const t = (v - 0.33) / 0.33;
+                [r, g, b] = lerpColor(TERRACOTTA, BURGUNDY, t);
+            } else {
+                const t = (v - 0.66) / 0.34;
+                [r, g, b] = lerpColor(BURGUNDY, NAVY, t);
+            }
+            return [Math.round(r), Math.round(g), Math.round(b), Math.round(alpha * 255)];
+        }
+
+        // Rendering
+        const imgData = ctx.createImageData(gridN, gridN);
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = gridN;
+        offCanvas.height = gridN;
+        const offCtx = offCanvas.getContext('2d');
+        const offImg = offCtx.createImageData(gridN, gridN);
+
+        function render(guidance) {
+            // Interpolate density
+            for (let iy = 0; iy < gridN; iy++) {
+                for (let ix = 0; ix < gridN; ix++) {
+                    const idx = iy * gridN + ix;
+                    // Interpolate between base and true distribution
+                    const v = densBase[idx] * (1 - guidance) + densTrue[idx] * guidance;
+                    // Apply power curve for contrast
+                    const vp = Math.pow(v, 0.6);
+                    const alpha = Math.min(1, vp * 1.2);
+                    const [r, g, b, a] = densityColor(vp, alpha);
+                    // Flip y for canvas
+                    const ci = ((gridN - 1 - iy) * gridN + ix) * 4;
+                    offImg.data[ci]     = r;
+                    offImg.data[ci + 1] = g;
+                    offImg.data[ci + 2] = b;
+                    offImg.data[ci + 3] = a;
+                }
+            }
+
+            offCtx.putImageData(offImg, 0, 0);
+
+            // Clear and draw background
+            ctx.fillStyle = '#FAF8F5';
+            ctx.fillRect(0, 0, W, H);
+
+            // Draw density (scaled to canvas)
+            const margin = { left: 50, right: 20, top: 20, bottom: 40 };
+            const plotW = W - margin.left - margin.right;
+            const plotH = H - margin.top - margin.bottom;
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.roundRect(margin.left, margin.top, plotW, plotH, 6);
+            ctx.clip();
+            ctx.drawImage(offCanvas, margin.left, margin.top, plotW, plotH);
+            ctx.restore();
+
+            // Draw contour lines for the current distribution
+            drawContours(guidance, margin, plotW, plotH);
+
+            // Draw mode centers as small markers
+            ctx.fillStyle = '#050532';
+            ctx.strokeStyle = '#FAF8F5';
+            ctx.lineWidth = 2;
+            for (const m of modes) {
+                const px = margin.left + ((m.cx - xMin) / (xMax - xMin)) * plotW;
+                const py = margin.top + ((yMax - m.cy) / (yMax - yMin)) * plotH;
+                ctx.beginPath();
+                ctx.arc(px, py, 4, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+
+            // Axes
+            ctx.strokeStyle = '#050532';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(margin.left, margin.top + plotH);
+            ctx.lineTo(margin.left + plotW, margin.top + plotH);
+            ctx.moveTo(margin.left, margin.top);
+            ctx.lineTo(margin.left, margin.top + plotH);
+            ctx.stroke();
+
+            // Axis labels
+            ctx.fillStyle = '#050532';
+            ctx.font = '13px Helvetica Neue, Helvetica, Arial, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('x\u2081', margin.left + plotW / 2, H - 8);
+            ctx.save();
+            ctx.translate(15, margin.top + plotH / 2);
+            ctx.rotate(-Math.PI / 2);
+            ctx.fillText('x\u2082', 0, 0);
+            ctx.restore();
+
+            // Tick marks
+            ctx.font = '11px Helvetica Neue, Helvetica, Arial, sans-serif';
+            ctx.fillStyle = '#656C75';
+            ctx.textAlign = 'center';
+            for (let v = -2; v <= 2; v++) {
+                const px = margin.left + ((v - xMin) / (xMax - xMin)) * plotW;
+                ctx.beginPath();
+                ctx.moveTo(px, margin.top + plotH);
+                ctx.lineTo(px, margin.top + plotH + 5);
+                ctx.stroke();
+                ctx.fillText(v, px, margin.top + plotH + 17);
+            }
+            ctx.textAlign = 'right';
+            for (let v = -2; v <= 2; v++) {
+                const py = margin.top + ((yMax - v) / (yMax - yMin)) * plotH;
+                ctx.beginPath();
+                ctx.moveTo(margin.left - 5, py);
+                ctx.lineTo(margin.left, py);
+                ctx.stroke();
+                ctx.fillText(v, margin.left - 8, py + 4);
+            }
+
+            // Update labels opacity
+            labelBase.style.opacity = 1 - guidance * 0.7;
+            labelFDFO.style.opacity = 0.3 + guidance * 0.7;
+        }
+
+        // Draw contour lines using marching squares (simplified)
+        function drawContours(guidance, margin, plotW, plotH) {
+            const levels = [0.15, 0.35, 0.6, 0.8];
+            const dens = new Float32Array(gridN * gridN);
+            for (let i = 0; i < dens.length; i++) {
+                dens[i] = densBase[i] * (1 - guidance) + densTrue[i] * guidance;
+            }
+
+            ctx.lineWidth = 1;
+            ctx.globalAlpha = 0.4;
+
+            for (const level of levels) {
+                ctx.strokeStyle = '#050532';
+                ctx.beginPath();
+
+                for (let iy = 0; iy < gridN - 1; iy++) {
+                    for (let ix = 0; ix < gridN - 1; ix++) {
+                        const v00 = dens[iy * gridN + ix];
+                        const v10 = dens[iy * gridN + ix + 1];
+                        const v01 = dens[(iy + 1) * gridN + ix];
+                        const v11 = dens[(iy + 1) * gridN + ix + 1];
+
+                        // Simple marching squares - find edges that cross the level
+                        const edges = [];
+                        if ((v00 >= level) !== (v10 >= level)) {
+                            const t = (level - v00) / (v10 - v00);
+                            edges.push([ix + t, iy]);
+                        }
+                        if ((v10 >= level) !== (v11 >= level)) {
+                            const t = (level - v10) / (v11 - v10);
+                            edges.push([ix + 1, iy + t]);
+                        }
+                        if ((v01 >= level) !== (v11 >= level)) {
+                            const t = (level - v01) / (v11 - v01);
+                            edges.push([ix + t, iy + 1]);
+                        }
+                        if ((v00 >= level) !== (v01 >= level)) {
+                            const t = (level - v00) / (v01 - v00);
+                            edges.push([ix, iy + t]);
+                        }
+
+                        if (edges.length >= 2) {
+                            const px0 = margin.left + (edges[0][0] / gridN) * plotW;
+                            const py0 = margin.top + (1 - edges[0][1] / gridN) * plotH;
+                            const px1 = margin.left + (edges[1][0] / gridN) * plotW;
+                            const py1 = margin.top + (1 - edges[1][1] / gridN) * plotH;
+                            ctx.moveTo(px0, py0);
+                            ctx.lineTo(px1, py1);
+                            // Handle ambiguous case with 4 edges
+                            if (edges.length === 4) {
+                                const px2 = margin.left + (edges[2][0] / gridN) * plotW;
+                                const py2 = margin.top + (1 - edges[2][1] / gridN) * plotH;
+                                const px3 = margin.left + (edges[3][0] / gridN) * plotW;
+                                const py3 = margin.top + (1 - edges[3][1] / gridN) * plotH;
+                                ctx.moveTo(px2, py2);
+                                ctx.lineTo(px3, py3);
+                            }
+                        }
+                    }
+                }
+                ctx.stroke();
+            }
+            ctx.globalAlpha = 1;
+        }
+
+        // Events
+        slider.addEventListener('input', function() {
+            const g = parseFloat(this.value);
+            sliderVal.textContent = g.toFixed(2);
+            render(g);
+        });
+
+        // Handle resize
+        function handleResize() {
+            // Canvas is CSS-responsive, no re-init needed for fixed pixel canvas
+            render(parseFloat(slider.value));
+        }
+        window.addEventListener('resize', handleResize);
+
+        // Initial render
+        render(0);
+    })();
+    </script>
+</body>
+</html>

@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CFG vs FDFO Post-Training</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background-color: #FAF8F5;
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            color: #050532;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .viz-container {
+            width: 100%;
+            max-width: 760px;
+        }
+        .panels {
+            display: flex;
+            gap: 16px;
+            width: 100%;
+        }
+        .panel {
+            flex: 1;
+            position: relative;
+        }
+        .panel-title {
+            text-align: center;
+            font-size: 14px;
+            font-weight: 700;
+            margin-bottom: 6px;
+            padding: 6px 0;
+            border-radius: 6px 6px 0 0;
+        }
+        .panel-title.cfg { color: #656C75; background: rgba(101,108,117,0.08); }
+        .panel-title.fdfo { color: #732424; background: rgba(115,36,36,0.08); }
+        .panel canvas {
+            width: 100%;
+            display: block;
+            border-radius: 0 0 6px 6px;
+        }
+        .panel-subtitle {
+            text-align: center;
+            font-size: 11px;
+            color: #656C75;
+            margin-top: 4px;
+            font-style: italic;
+        }
+        .controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 20px;
+            margin-top: 16px;
+            flex-wrap: wrap;
+        }
+        .seed-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .seed-group label {
+            font-size: 13px;
+            font-weight: 600;
+            color: #050532;
+        }
+        .seed-btn {
+            width: 32px;
+            height: 32px;
+            border: 2px solid #050532;
+            border-radius: 50%;
+            background: #FAF8F5;
+            color: #050532;
+            font-weight: 700;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .seed-btn:hover { background: rgba(5,5,50,0.06); }
+        .seed-btn.active {
+            background: #050532;
+            color: #FAF8F5;
+        }
+        .caption {
+            margin-top: 12px;
+            font-size: 12px;
+            color: #656C75;
+            text-align: center;
+            line-height: 1.4;
+        }
+        @media (max-width: 600px) {
+            body { padding: 10px; }
+            .panels { gap: 8px; }
+            .panel-title { font-size: 12px; }
+            .seed-btn { width: 36px; height: 36px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="viz-container">
+        <div class="panels">
+            <div class="panel">
+                <div class="panel-title cfg">With CFG (w = 4.5)</div>
+                <canvas id="canvasCFG"></canvas>
+                <div class="panel-subtitle">Inference-time sharpening</div>
+            </div>
+            <div class="panel">
+                <div class="panel-title fdfo">After FDFO Training</div>
+                <canvas id="canvasFDFO"></canvas>
+                <div class="panel-subtitle">Quality baked into model</div>
+            </div>
+        </div>
+        <div class="controls">
+            <div class="seed-group">
+                <label>Seed:</label>
+                <button class="seed-btn active" data-seed="1">1</button>
+                <button class="seed-btn" data-seed="2">2</button>
+                <button class="seed-btn" data-seed="3">3</button>
+                <button class="seed-btn" data-seed="4">4</button>
+            </div>
+        </div>
+        <div class="caption">
+            <b>Left:</b> The base model is diffuse; classifier-free guidance (w&nbsp;=&nbsp;4.5) sharpens it at inference time, but can overshoot and distort modes.
+            <b>Right:</b> FDFO training makes the model inherently sharp &mdash; no guidance needed (w&nbsp;=&nbsp;1).
+        </div>
+    </div>
+
+    <script>
+    (function() {
+        const canvasCFG = document.getElementById('canvasCFG');
+        const canvasFDFO = document.getElementById('canvasFDFO');
+        const ctxCFG = canvasCFG.getContext('2d');
+        const ctxFDFO = canvasFDFO.getContext('2d');
+
+        const dpr = window.devicePixelRatio || 1;
+        const S = 360; // logical size per panel
+        [canvasCFG, canvasFDFO].forEach(c => {
+            c.width = S * dpr;
+            c.height = S * dpr;
+            c.style.width = '100%';
+            c.style.aspectRatio = '1/1';
+        });
+        ctxCFG.scale(dpr, dpr);
+        ctxFDFO.scale(dpr, dpr);
+
+        // Palette
+        const NAVY = [5, 5, 50];
+        const BURGUNDY = [115, 36, 36];
+        const TERRACOTTA = [171, 128, 100];
+        const CREAM = [250, 248, 245];
+        const SLATE = [101, 108, 117];
+
+        // Seed configurations (different mixture layouts)
+        const seedConfigs = {
+            1: [
+                { cx: -1.0, cy:  0.8 },
+                { cx:  1.1, cy:  0.6 },
+                { cx: -0.3, cy: -1.0 },
+                { cx:  0.9, cy: -0.7 },
+            ],
+            2: [
+                { cx:  0.0, cy:  1.2 },
+                { cx: -1.2, cy: -0.3 },
+                { cx:  1.2, cy: -0.5 },
+            ],
+            3: [
+                { cx: -0.8, cy:  0.9 },
+                { cx:  0.8, cy:  0.9 },
+                { cx: -0.8, cy: -0.9 },
+                { cx:  0.8, cy: -0.9 },
+                { cx:  0.0, cy:  0.0 },
+            ],
+            4: [
+                { cx: -0.6, cy:  0.4 },
+                { cx:  0.7, cy:  1.0 },
+                { cx:  0.2, cy: -0.8 },
+                { cx: -1.1, cy: -0.6 },
+            ],
+        };
+
+        const xMin = -2.5, xMax = 2.5;
+        const gridN = 180;
+        const dd = (xMax - xMin) / gridN;
+
+        // Sigma values
+        const sigmaBase = 0.60;   // diffuse base model
+        const sigmaCFG = 0.22;    // CFG-sharpened (may overshoot)
+        const sigmaFDFO = 0.20;   // FDFO-trained (clean)
+
+        // CFG can distort: we slightly shift modes and add artifacts
+        function cfgDistortion(mode, idx) {
+            // Slight radial overshoot toward origin
+            const dist = Math.sqrt(mode.cx * mode.cx + mode.cy * mode.cy);
+            const factor = 0.12;
+            return {
+                cx: mode.cx * (1 + factor / (dist + 0.5)),
+                cy: mode.cy * (1 + factor / (dist + 0.5))
+            };
+        }
+
+        function gauss2D(x, y, cx, cy, sigma) {
+            const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+            return Math.exp(-r2 / (2 * sigma * sigma));
+        }
+
+        function lerpColor(c1, c2, t) {
+            return [
+                c1[0] + (c2[0] - c1[0]) * t,
+                c1[1] + (c2[1] - c1[1]) * t,
+                c1[2] + (c2[2] - c1[2]) * t,
+            ];
+        }
+
+        function densityColor(v, palette) {
+            // palette = 'grey' (CFG) or 'warm' (FDFO)
+            let r, g, b;
+            if (palette === 'grey') {
+                // cream -> slate -> navy
+                if (v < 0.5) {
+                    const t = v / 0.5;
+                    [r, g, b] = lerpColor(CREAM, SLATE, t);
+                } else {
+                    const t = (v - 0.5) / 0.5;
+                    [r, g, b] = lerpColor(SLATE, NAVY, t);
+                }
+            } else {
+                // cream -> terracotta -> burgundy -> navy
+                if (v < 0.33) {
+                    const t = v / 0.33;
+                    [r, g, b] = lerpColor(CREAM, TERRACOTTA, t);
+                } else if (v < 0.66) {
+                    const t = (v - 0.33) / 0.33;
+                    [r, g, b] = lerpColor(TERRACOTTA, BURGUNDY, t);
+                } else {
+                    const t = (v - 0.66) / 0.34;
+                    [r, g, b] = lerpColor(BURGUNDY, NAVY, t);
+                }
+            }
+            return [Math.round(r), Math.round(g), Math.round(b)];
+        }
+
+        // Off-screen canvases
+        const offCFG = document.createElement('canvas');
+        offCFG.width = gridN; offCFG.height = gridN;
+        const offCtxCFG = offCFG.getContext('2d');
+        const offImgCFG = offCtxCFG.createImageData(gridN, gridN);
+
+        const offFDFO = document.createElement('canvas');
+        offFDFO.width = gridN; offFDFO.height = gridN;
+        const offCtxFDFO = offFDFO.getContext('2d');
+        const offImgFDFO = offCtxFDFO.createImageData(gridN, gridN);
+
+        let currentSeed = 1;
+
+        function computeAndRender() {
+            const modes = seedConfigs[currentSeed];
+
+            // Compute CFG density (sharpened + distorted)
+            const densCFG = new Float32Array(gridN * gridN);
+            const densFDFO = new Float32Array(gridN * gridN);
+            // Also compute a faint "ghost" of the base for CFG panel
+            const densBaseGhost = new Float32Array(gridN * gridN);
+
+            for (let iy = 0; iy < gridN; iy++) {
+                const y = xMin + (iy + 0.5) * dd;
+                for (let ix = 0; ix < gridN; ix++) {
+                    const x = xMin + (ix + 0.5) * dd;
+                    let vCFG = 0, vFDFO = 0, vBase = 0;
+                    for (let mi = 0; mi < modes.length; mi++) {
+                        const m = modes[mi];
+                        const mCFG = cfgDistortion(m, mi);
+                        vCFG += gauss2D(x, y, mCFG.cx, mCFG.cy, sigmaCFG);
+                        vFDFO += gauss2D(x, y, m.cx, m.cy, sigmaFDFO);
+                        vBase += gauss2D(x, y, m.cx, m.cy, sigmaBase);
+                    }
+                    const idx = iy * gridN + ix;
+                    densCFG[idx] = vCFG;
+                    densFDFO[idx] = vFDFO;
+                    densBaseGhost[idx] = vBase;
+                }
+            }
+
+            // Normalize
+            let maxCFG = 0, maxFDFO = 0, maxBase = 0;
+            for (let i = 0; i < densCFG.length; i++) {
+                if (densCFG[i] > maxCFG) maxCFG = densCFG[i];
+                if (densFDFO[i] > maxFDFO) maxFDFO = densFDFO[i];
+                if (densBaseGhost[i] > maxBase) maxBase = densBaseGhost[i];
+            }
+
+            // Render CFG panel
+            for (let iy = 0; iy < gridN; iy++) {
+                for (let ix = 0; ix < gridN; ix++) {
+                    const idx = iy * gridN + ix;
+                    const v = densCFG[idx] / maxCFG;
+                    const vGhost = densBaseGhost[idx] / maxBase;
+                    // Blend: CFG sharp + faint base ghost
+                    const vp = Math.pow(v, 0.6);
+                    const vpGhost = Math.pow(vGhost, 0.6) * 0.15;
+                    const final_v = Math.min(1, vp + vpGhost);
+                    const alpha = Math.min(1, final_v * 1.2);
+                    const [r, g, b] = densityColor(final_v, 'grey');
+                    const ci = ((gridN - 1 - iy) * gridN + ix) * 4;
+                    offImgCFG.data[ci]     = r;
+                    offImgCFG.data[ci + 1] = g;
+                    offImgCFG.data[ci + 2] = b;
+                    offImgCFG.data[ci + 3] = Math.round(alpha * 255);
+                }
+            }
+            offCtxCFG.putImageData(offImgCFG, 0, 0);
+
+            // Render FDFO panel
+            for (let iy = 0; iy < gridN; iy++) {
+                for (let ix = 0; ix < gridN; ix++) {
+                    const idx = iy * gridN + ix;
+                    const v = densFDFO[idx] / maxFDFO;
+                    const vp = Math.pow(v, 0.6);
+                    const alpha = Math.min(1, vp * 1.2);
+                    const [r, g, b] = densityColor(vp, 'warm');
+                    const ci = ((gridN - 1 - iy) * gridN + ix) * 4;
+                    offImgFDFO.data[ci]     = r;
+                    offImgFDFO.data[ci + 1] = g;
+                    offImgFDFO.data[ci + 2] = b;
+                    offImgFDFO.data[ci + 3] = Math.round(alpha * 255);
+                }
+            }
+            offCtxFDFO.putImageData(offImgFDFO, 0, 0);
+
+            // Draw to main canvases
+            renderPanel(ctxCFG, offCFG, modes, true);
+            renderPanel(ctxFDFO, offFDFO, modes, false);
+        }
+
+        function renderPanel(ctx, offCanvas, modes, isCFG) {
+            const margin = { left: 30, right: 10, top: 10, bottom: 30 };
+            const plotW = S - margin.left - margin.right;
+            const plotH = S - margin.top - margin.bottom;
+
+            ctx.fillStyle = '#FAF8F5';
+            ctx.fillRect(0, 0, S, S);
+
+            // Draw density
+            ctx.save();
+            ctx.beginPath();
+            ctx.roundRect(margin.left, margin.top, plotW, plotH, 4);
+            ctx.clip();
+            ctx.drawImage(offCanvas, margin.left, margin.top, plotW, plotH);
+            ctx.restore();
+
+            // Draw contour lines
+            drawPanelContours(ctx, offCanvas, margin, plotW, plotH);
+
+            // Mode markers
+            for (const m of modes) {
+                const dm = isCFG ? cfgDistortion(m, 0) : m;
+                const px = margin.left + ((dm.cx - xMin) / (xMax - xMin)) * plotW;
+                const py = margin.top + ((xMax - dm.cy) / (xMax - xMin)) * plotH;
+                ctx.fillStyle = isCFG ? '#656C75' : '#732424';
+                ctx.strokeStyle = '#FAF8F5';
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+
+            // If CFG, draw a faint ring around distorted modes to show overshoot
+            if (isCFG) {
+                ctx.strokeStyle = 'rgba(101,108,117,0.3)';
+                ctx.lineWidth = 1;
+                ctx.setLineDash([3, 3]);
+                for (const m of modes) {
+                    const dm = cfgDistortion(m, 0);
+                    const px = margin.left + ((dm.cx - xMin) / (xMax - xMin)) * plotW;
+                    const py = margin.top + ((xMax - dm.cy) / (xMax - xMin)) * plotH;
+                    const r = (sigmaCFG * 2.5 / (xMax - xMin)) * plotW;
+                    ctx.beginPath();
+                    ctx.arc(px, py, r, 0, Math.PI * 2);
+                    ctx.stroke();
+                }
+                ctx.setLineDash([]);
+            }
+
+            // Axes
+            ctx.strokeStyle = '#050532';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(margin.left, margin.top + plotH);
+            ctx.lineTo(margin.left + plotW, margin.top + plotH);
+            ctx.moveTo(margin.left, margin.top);
+            ctx.lineTo(margin.left, margin.top + plotH);
+            ctx.stroke();
+
+            // Ticks
+            ctx.font = '10px Helvetica Neue, Helvetica, Arial, sans-serif';
+            ctx.fillStyle = '#656C75';
+            ctx.textAlign = 'center';
+            for (let v = -2; v <= 2; v++) {
+                const px = margin.left + ((v - xMin) / (xMax - xMin)) * plotW;
+                ctx.beginPath();
+                ctx.moveTo(px, margin.top + plotH);
+                ctx.lineTo(px, margin.top + plotH + 4);
+                ctx.stroke();
+                ctx.fillText(v, px, margin.top + plotH + 14);
+            }
+            ctx.textAlign = 'right';
+            for (let v = -2; v <= 2; v++) {
+                const py = margin.top + ((xMax - v) / (xMax - xMin)) * plotH;
+                ctx.beginPath();
+                ctx.moveTo(margin.left - 4, py);
+                ctx.lineTo(margin.left, py);
+                ctx.stroke();
+                ctx.fillText(v, margin.left - 6, py + 3);
+            }
+
+            // Guidance label in corner
+            ctx.font = 'bold 11px Helvetica Neue, Helvetica, Arial, sans-serif';
+            ctx.textAlign = 'right';
+            ctx.fillStyle = isCFG ? '#656C75' : '#732424';
+            ctx.fillText(isCFG ? 'w = 4.5' : 'w = 1.0', margin.left + plotW - 6, margin.top + 16);
+        }
+
+        function drawPanelContours(ctx, offCanvas, margin, plotW, plotH) {
+            // Read pixel data and derive contours from luminance
+            const tmpCtx = offCanvas.getContext('2d');
+            const data = tmpCtx.getImageData(0, 0, gridN, gridN).data;
+            const levels = [60, 120, 180];
+
+            ctx.lineWidth = 0.8;
+            ctx.globalAlpha = 0.25;
+            ctx.strokeStyle = '#050532';
+
+            for (const level of levels) {
+                ctx.beginPath();
+                for (let iy = 0; iy < gridN - 1; iy++) {
+                    for (let ix = 0; ix < gridN - 1; ix++) {
+                        // Use alpha channel as density proxy
+                        const a00 = data[((gridN - 1 - iy) * gridN + ix) * 4 + 3];
+                        const a10 = data[((gridN - 1 - iy) * gridN + ix + 1) * 4 + 3];
+                        const a01 = data[((gridN - 2 - iy) * gridN + ix) * 4 + 3];
+                        const a11 = data[((gridN - 2 - iy) * gridN + ix + 1) * 4 + 3];
+
+                        const edges = [];
+                        if ((a00 >= level) !== (a10 >= level)) {
+                            const t = (level - a00) / (a10 - a00);
+                            edges.push([ix + t, iy]);
+                        }
+                        if ((a10 >= level) !== (a11 >= level)) {
+                            const t = (level - a10) / (a11 - a10);
+                            edges.push([ix + 1, iy + t]);
+                        }
+                        if ((a01 >= level) !== (a11 >= level)) {
+                            const t = (level - a01) / (a11 - a01);
+                            edges.push([ix + t, iy + 1]);
+                        }
+                        if ((a00 >= level) !== (a01 >= level)) {
+                            const t = (level - a00) / (a01 - a00);
+                            edges.push([ix, iy + t]);
+                        }
+
+                        if (edges.length >= 2) {
+                            const px0 = margin.left + (edges[0][0] / gridN) * plotW;
+                            const py0 = margin.top + (edges[0][1] / gridN) * plotH;
+                            const px1 = margin.left + (edges[1][0] / gridN) * plotW;
+                            const py1 = margin.top + (edges[1][1] / gridN) * plotH;
+                            ctx.moveTo(px0, py0);
+                            ctx.lineTo(px1, py1);
+                        }
+                    }
+                }
+                ctx.stroke();
+            }
+            ctx.globalAlpha = 1;
+        }
+
+        // Seed buttons
+        document.querySelectorAll('.seed-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.seed-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                currentSeed = parseInt(this.dataset.seed);
+                computeAndRender();
+            });
+        });
+
+        // Initial render
+        computeAndRender();
+    })();
+    </script>
+</body>
+</html>

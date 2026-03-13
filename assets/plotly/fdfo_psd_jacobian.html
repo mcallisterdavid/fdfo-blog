@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PSD Jacobian Condition — Interactive 2D</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Helvetica Neue',Arial,sans-serif;background:#FAF8F5;color:#050532;overflow-x:hidden}
+.wrap{max-width:760px;margin:0 auto;padding:16px}
+h3{text-align:center;font:bold 16px/1.4 'Helvetica Neue',Arial,sans-serif;color:#050532;margin-bottom:4px}
+.subtitle{text-align:center;font:12px/1.4 'Helvetica Neue',Arial,sans-serif;color:#656C75;margin-bottom:12px}
+.main{display:flex;gap:16px;align-items:flex-start;justify-content:center;flex-wrap:wrap}
+.canvas-wrap{position:relative;flex:1;min-width:300px;max-width:480px}
+canvas{width:100%;aspect-ratio:1/1;border-radius:10px;border:1.5px solid #e0ddd8;display:block;background:#FAF8F5;cursor:grab}
+canvas:active{cursor:grabbing}
+.sidebar{flex:0 0 220px;min-width:200px}
+.matrix-box{background:#f5f3ef;border:1.5px solid #e0ddd8;border-radius:8px;padding:12px;margin-bottom:12px}
+.matrix-title{font:bold 12px/1.4 'Helvetica Neue',Arial,sans-serif;color:#050532;margin-bottom:8px;text-align:center}
+.matrix-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.matrix-cell{display:flex;flex-direction:column;gap:2px}
+.matrix-cell label{font:bold 10px/1 'Helvetica Neue',Arial,sans-serif;color:#656C75}
+.matrix-cell input[type=range]{width:100%;height:3px;-webkit-appearance:none;background:#ddd;border-radius:3px;outline:none}
+.matrix-cell input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#050532;cursor:pointer}
+.matrix-cell input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:#050532;cursor:pointer;border:none}
+.matrix-cell .val{font:bold 11px/1 'Helvetica Neue',Arial,sans-serif;color:#050532;text-align:right}
+.info-box{background:#f5f3ef;border:1.5px solid #e0ddd8;border-radius:8px;padding:12px}
+.info-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.info-row:last-child{margin-bottom:0}
+.info-label{font:11px/1 'Helvetica Neue',Arial,sans-serif;color:#656C75}
+.info-val{font:bold 13px/1 'Helvetica Neue',Arial,sans-serif}
+.info-val.good{color:#2a7d3f}
+.info-val.bad{color:#a02020}
+.status-badge{display:inline-block;padding:4px 10px;border-radius:4px;font:bold 11px/1 'Helvetica Neue',Arial,sans-serif;margin-top:4px;text-align:center;width:100%}
+.status-badge.psd{background:rgba(42,125,63,0.12);color:#2a7d3f;border:1px solid rgba(42,125,63,0.25)}
+.status-badge.notpsd{background:rgba(160,32,32,0.12);color:#a02020;border:1px solid rgba(160,32,32,0.25)}
+.presets{display:flex;gap:4px;flex-wrap:wrap;margin-top:10px;justify-content:center}
+.preset{padding:4px 10px;font:bold 10px/1 'Helvetica Neue',Arial,sans-serif;border:1.5px solid #050532;border-radius:4px;cursor:pointer;background:#FAF8F5;color:#050532;user-select:none}
+.preset:hover{background:#050532;color:#FAF8F5}
+.caption{text-align:center;margin-top:12px;color:#656C75;font:12px/1.6 'Helvetica Neue',Arial,sans-serif;max-width:700px;margin-left:auto;margin-right:auto}
+@media(max-width:600px){.main{flex-direction:column;align-items:center}.sidebar{flex:0 0 auto;width:100%;max-width:400px}.canvas-wrap{max-width:100%}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h3>PSD Jacobian Condition</h3>
+  <div class="subtitle">When is a copied gradient still a descent direction?</div>
+
+  <div class="main">
+    <div class="canvas-wrap">
+      <canvas id="cv"></canvas>
+    </div>
+    <div class="sidebar">
+      <div class="matrix-box">
+        <div class="matrix-title">Jacobian J</div>
+        <div class="matrix-grid">
+          <div class="matrix-cell">
+            <label>J₁₁ <span class="val" id="vJ00">1.0</span></label>
+            <input type="range" id="sJ00" min="-2" max="2" step="0.05" value="1.0">
+          </div>
+          <div class="matrix-cell">
+            <label>J₁₂ <span class="val" id="vJ01">0.0</span></label>
+            <input type="range" id="sJ01" min="-2" max="2" step="0.05" value="0.0">
+          </div>
+          <div class="matrix-cell">
+            <label>J₂₁ <span class="val" id="vJ10">0.0</span></label>
+            <input type="range" id="sJ10" min="-2" max="2" step="0.05" value="0.0">
+          </div>
+          <div class="matrix-cell">
+            <label>J₂₂ <span class="val" id="vJ11">1.0</span></label>
+            <input type="range" id="sJ11" min="-2" max="2" step="0.05" value="1.0">
+          </div>
+        </div>
+      </div>
+      <div class="info-box">
+        <div class="info-row">
+          <span class="info-label">Angle(∇R, J·∇R)</span>
+          <span class="info-val" id="angleVal">0°</span>
+        </div>
+        <div class="info-row">
+          <span class="info-label">Eigenvalues</span>
+          <span class="info-val" id="eigVal">1.0, 1.0</span>
+        </div>
+        <div class="info-row">
+          <span class="info-label">det(J + Jᵀ)/2</span>
+          <span class="info-val" id="detVal">1.0</span>
+        </div>
+        <div id="statusBadge" class="status-badge psd">✓ PSD — Descent direction preserved</div>
+      </div>
+      <div class="presets">
+        <div class="preset" data-j="1,0,0,1">Identity</div>
+        <div class="preset" data-j="2,0,0,0.5">Stretch</div>
+        <div class="preset" data-j="0.5,-0.8,0.8,0.5">Rotation</div>
+        <div class="preset" data-j="-0.5,0,0,-0.5">Flip</div>
+        <div class="preset" data-j="1.5,0.3,0.3,1.5">PSD</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="caption">
+    Drag the <b style="color:#050532">navy arrow</b> (∇R) to change the reward gradient direction.
+    Adjust the Jacobian J with sliders. The <b style="color:#AB8064">terracotta arrow</b> shows J·∇R.
+    When the angle between them is &lt; 90°, the copied gradient is still a valid descent direction.
+  </div>
+</div>
+
+<script>
+// ==========================================================
+// State
+// ==========================================================
+let J = [[1, 0], [0, 1]];
+let gradAngle = Math.PI / 4; // angle of ∇R from positive x
+let dragging = false;
+
+// ==========================================================
+// Canvas setup
+// ==========================================================
+const canvas = document.getElementById('cv');
+let W, H, cx, cy, scale;
+
+function setupCanvas() {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  W = rect.width;
+  H = rect.height;
+  cx = W / 2;
+  cy = H / 2;
+  scale = Math.min(W, H) * 0.35;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return ctx;
+}
+
+// ==========================================================
+// Math helpers
+// ==========================================================
+function matVec(M, v) {
+  return [M[0][0] * v[0] + M[0][1] * v[1],
+          M[1][0] * v[0] + M[1][1] * v[1]];
+}
+
+function angleBetween(a, b) {
+  const dot = a[0] * b[0] + a[1] * b[1];
+  const ma = Math.sqrt(a[0] ** 2 + a[1] ** 2);
+  const mb = Math.sqrt(b[0] ** 2 + b[1] ** 2);
+  if (ma < 1e-10 || mb < 1e-10) return 0;
+  return Math.acos(Math.max(-1, Math.min(1, dot / (ma * mb))));
+}
+
+function eigenvalues2x2(M) {
+  // Symmetrize: S = (M + M^T) / 2
+  const a = (M[0][0] + M[0][0]) / 2;
+  const b = (M[0][1] + M[1][0]) / 2;
+  const d = (M[1][1] + M[1][1]) / 2;
+  const trace = a + d;
+  const det = a * d - b * b;
+  const disc = trace * trace / 4 - det;
+  if (disc < 0) return [trace / 2, trace / 2]; // complex
+  const sq = Math.sqrt(disc);
+  return [trace / 2 + sq, trace / 2 - sq];
+}
+
+// ==========================================================
+// Drawing
+// ==========================================================
+function drawArrow(ctx, ox, oy, dx, dy, color, lineW, headLen) {
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 1) return;
+  const angle = Math.atan2(dy, dx);
+  headLen = headLen || Math.min(12, len * 0.3);
+
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = lineW || 3;
+  ctx.lineCap = 'round';
+
+  ctx.beginPath();
+  ctx.moveTo(ox, oy);
+  ctx.lineTo(ox + dx - Math.cos(angle) * headLen * 0.3, oy + dy - Math.sin(angle) * headLen * 0.3);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(ox + dx, oy + dy);
+  ctx.lineTo(ox + dx - Math.cos(angle - 0.4) * headLen, oy + dy - Math.sin(angle - 0.4) * headLen);
+  ctx.lineTo(ox + dx - Math.cos(angle + 0.4) * headLen, oy + dy - Math.sin(angle + 0.4) * headLen);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function render() {
+  const ctx = setupCanvas();
+  ctx.clearRect(0, 0, W, H);
+
+  const grad = [Math.cos(gradAngle), Math.sin(gradAngle)];
+  const Jgrad = matVec(J, grad);
+  const angle = angleBetween(grad, Jgrad);
+  const angleDeg = angle * 180 / Math.PI;
+  const isPSD = angleDeg < 90;
+
+  // 90° half-space boundary (perpendicular to ∇R)
+  const perpX = -Math.sin(gradAngle);
+  const perpY = Math.cos(gradAngle);
+
+  // Fill half-spaces
+  // Valid side (same direction as ∇R)
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(cx + perpX * scale * 3, cy - perpY * scale * 3);
+  ctx.lineTo(cx - perpX * scale * 3, cy + perpY * scale * 3);
+  ctx.lineTo(cx - perpX * scale * 3 + grad[0] * scale * 3, cy + perpY * scale * 3 - grad[1] * scale * 3);
+  ctx.lineTo(cx + perpX * scale * 3 + grad[0] * scale * 3, cy - perpY * scale * 3 - grad[1] * scale * 3);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(42,125,63,0.06)';
+  ctx.fill();
+  ctx.restore();
+
+  // Invalid side
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(cx + perpX * scale * 3, cy - perpY * scale * 3);
+  ctx.lineTo(cx - perpX * scale * 3, cy + perpY * scale * 3);
+  ctx.lineTo(cx - perpX * scale * 3 - grad[0] * scale * 3, cy + perpY * scale * 3 + grad[1] * scale * 3);
+  ctx.lineTo(cx + perpX * scale * 3 - grad[0] * scale * 3, cy - perpY * scale * 3 + grad[1] * scale * 3);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(160,32,32,0.06)';
+  ctx.fill();
+  ctx.restore();
+
+  // Boundary line
+  ctx.strokeStyle = '#c8c5be';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(cx + perpX * scale * 2.5, cy - perpY * scale * 2.5);
+  ctx.lineTo(cx - perpX * scale * 2.5, cy + perpY * scale * 2.5);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Boundary label
+  ctx.fillStyle = '#656C75';
+  ctx.font = '10px "Helvetica Neue",Arial,sans-serif';
+  ctx.textAlign = 'center';
+  const lblX = cx + perpX * scale * 1.5;
+  const lblY = cy - perpY * scale * 1.5;
+  ctx.fillText('90° boundary', lblX, lblY - 8);
+
+  // Grid lines (light)
+  ctx.strokeStyle = 'rgba(5,5,50,0.06)';
+  ctx.lineWidth = 0.5;
+  for (let i = -3; i <= 3; i++) {
+    ctx.beginPath();
+    ctx.moveTo(cx + i * scale * 0.5, cy - scale * 2);
+    ctx.lineTo(cx + i * scale * 0.5, cy + scale * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - scale * 2, cy + i * scale * 0.5);
+    ctx.lineTo(cx + scale * 2, cy + i * scale * 0.5);
+    ctx.stroke();
+  }
+
+  // Origin dot
+  ctx.fillStyle = '#050532';
+  ctx.beginPath();
+  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Angle arc
+  if (Math.sqrt(Jgrad[0] ** 2 + Jgrad[1] ** 2) > 0.05) {
+    const arcR = scale * 0.25;
+    const startA = -gradAngle; // canvas y is flipped
+    const endA = -Math.atan2(Jgrad[1], Jgrad[0]);
+
+    ctx.strokeStyle = isPSD ? 'rgba(42,125,63,0.5)' : 'rgba(160,32,32,0.5)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    // Draw the shorter arc
+    let sa = startA, ea = endA;
+    let diff = ea - sa;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    ctx.arc(cx, cy, arcR, sa, sa + diff, diff < 0);
+    ctx.stroke();
+
+    // Angle text
+    const midA = sa + diff / 2;
+    ctx.fillStyle = isPSD ? '#2a7d3f' : '#a02020';
+    ctx.font = 'bold 12px "Helvetica Neue",Arial,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(Math.round(angleDeg) + '°', cx + Math.cos(midA) * (arcR + 16), cy + Math.sin(midA) * (arcR + 16));
+  }
+
+  // ∇R arrow (navy)
+  drawArrow(ctx, cx, cy, grad[0] * scale, -grad[1] * scale, '#050532', 3.5, 14);
+
+  // ∇R label
+  const gLblX = cx + grad[0] * scale * 1.12;
+  const gLblY = cy - grad[1] * scale * 1.12;
+  ctx.fillStyle = '#050532';
+  ctx.font = 'bold 12px "Helvetica Neue",Arial,sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('∇R', gLblX, gLblY);
+
+  // J·∇R arrow (terracotta or red depending on validity)
+  const jColor = isPSD ? '#AB8064' : '#a02020';
+  const jMag = Math.sqrt(Jgrad[0] ** 2 + Jgrad[1] ** 2);
+  const jScale = Math.min(jMag, 2) * scale;
+  const jDir = jMag > 1e-10 ? [Jgrad[0] / jMag, Jgrad[1] / jMag] : [0, 0];
+  drawArrow(ctx, cx, cy, jDir[0] * jScale, -jDir[1] * jScale, jColor, 3, 12);
+
+  // J·∇R label
+  const jLblX = cx + jDir[0] * jScale * 1.1 + 4;
+  const jLblY = cy - jDir[1] * jScale * 1.1;
+  ctx.fillStyle = jColor;
+  ctx.font = 'bold 11px "Helvetica Neue",Arial,sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('J·∇R', jLblX, jLblY);
+
+  // Drag handle indicator on ∇R tip
+  const tipX = cx + grad[0] * scale;
+  const tipY = cy - grad[1] * scale;
+  ctx.strokeStyle = '#050532';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(tipX, tipY, 8, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Update info panel
+  document.getElementById('angleVal').textContent = Math.round(angleDeg) + '°';
+  document.getElementById('angleVal').className = 'info-val ' + (isPSD ? 'good' : 'bad');
+
+  const eigs = eigenvalues2x2(J);
+  document.getElementById('eigVal').textContent = eigs.map(e => e.toFixed(2)).join(', ');
+  document.getElementById('eigVal').className = 'info-val ' + (eigs[0] >= -0.01 && eigs[1] >= -0.01 ? 'good' : 'bad');
+
+  const symJ = [[(J[0][0] + J[0][0]) / 2, (J[0][1] + J[1][0]) / 2],
+                [(J[1][0] + J[0][1]) / 2, (J[1][1] + J[1][1]) / 2]];
+  const det = symJ[0][0] * symJ[1][1] - symJ[0][1] * symJ[1][0];
+  document.getElementById('detVal').textContent = det.toFixed(2);
+  document.getElementById('detVal').className = 'info-val ' + (det >= -0.01 ? 'good' : 'bad');
+
+  const badge = document.getElementById('statusBadge');
+  if (isPSD) {
+    badge.className = 'status-badge psd';
+    badge.textContent = '✓ PSD — Descent direction preserved';
+  } else {
+    badge.className = 'status-badge notpsd';
+    badge.textContent = '✗ Not PSD — Gradient goes uphill!';
+  }
+}
+
+// ==========================================================
+// Slider controls
+// ==========================================================
+const sliders = ['sJ00', 'sJ01', 'sJ10', 'sJ11'];
+const valSpans = ['vJ00', 'vJ01', 'vJ10', 'vJ11'];
+
+function readSliders() {
+  J[0][0] = parseFloat(document.getElementById('sJ00').value);
+  J[0][1] = parseFloat(document.getElementById('sJ01').value);
+  J[1][0] = parseFloat(document.getElementById('sJ10').value);
+  J[1][1] = parseFloat(document.getElementById('sJ11').value);
+
+  for (let i = 0; i < 4; i++) {
+    const v = parseFloat(document.getElementById(sliders[i]).value);
+    document.getElementById(valSpans[i]).textContent = v.toFixed(2);
+  }
+  render();
+}
+
+sliders.forEach(id => {
+  document.getElementById(id).addEventListener('input', readSliders);
+});
+
+// ==========================================================
+// Drag to move gradient direction
+// ==========================================================
+function getCanvasCoords(e) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX || e.touches[0].clientX) - rect.left;
+  const y = (e.clientY || e.touches[0].clientY) - rect.top;
+  return [x, y];
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  const [mx, my] = getCanvasCoords(e);
+  const tipX = cx + Math.cos(gradAngle) * scale;
+  const tipY = cy - Math.sin(gradAngle) * scale;
+  const dist = Math.sqrt((mx - tipX) ** 2 + (my - tipY) ** 2);
+  if (dist < 20) {
+    dragging = true;
+    e.preventDefault();
+  }
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  if (!dragging) return;
+  const [mx, my] = getCanvasCoords(e);
+  gradAngle = Math.atan2(-(my - cy), mx - cx);
+  render();
+});
+
+canvas.addEventListener('mouseup', () => { dragging = false; });
+canvas.addEventListener('mouseleave', () => { dragging = false; });
+
+// Touch support
+canvas.addEventListener('touchstart', (e) => {
+  const [mx, my] = getCanvasCoords(e);
+  const tipX = cx + Math.cos(gradAngle) * scale;
+  const tipY = cy - Math.sin(gradAngle) * scale;
+  const dist = Math.sqrt((mx - tipX) ** 2 + (my - tipY) ** 2);
+  if (dist < 30) {
+    dragging = true;
+    e.preventDefault();
+  }
+}, { passive: false });
+
+canvas.addEventListener('touchmove', (e) => {
+  if (!dragging) return;
+  e.preventDefault();
+  const [mx, my] = getCanvasCoords(e);
+  gradAngle = Math.atan2(-(my - cy), mx - cx);
+  render();
+}, { passive: false });
+
+canvas.addEventListener('touchend', () => { dragging = false; });
+
+// ==========================================================
+// Presets
+// ==========================================================
+document.querySelectorAll('.preset').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const vals = btn.dataset.j.split(',').map(Number);
+    J = [[vals[0], vals[1]], [vals[2], vals[3]]];
+    document.getElementById('sJ00').value = vals[0];
+    document.getElementById('sJ01').value = vals[1];
+    document.getElementById('sJ10').value = vals[2];
+    document.getElementById('sJ11').value = vals[3];
+    for (let i = 0; i < 4; i++) {
+      document.getElementById(valSpans[i]).textContent = vals[i].toFixed(2);
+    }
+    render();
+  });
+});
+
+window.addEventListener('resize', render);
+render();
+</script>
+</body>
+</html>

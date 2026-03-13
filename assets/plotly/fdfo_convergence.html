@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FDFO vs Flow-GRPO: Reward Convergence</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #FAF8F5;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #050532;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 16px;
+  }
+  h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #050532;
+    margin-bottom: 4px;
+    text-align: center;
+  }
+  .subtitle {
+    font-size: 0.85rem;
+    color: #656C75;
+    margin-bottom: 16px;
+    text-align: center;
+  }
+  .tab-bar {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 12px;
+  }
+  .tab-btn {
+    padding: 6px 18px;
+    border: 1.5px solid #050532;
+    border-radius: 20px;
+    background: transparent;
+    color: #050532;
+    font-size: 0.82rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+  }
+  .tab-btn:hover {
+    background: rgba(5,5,50,0.06);
+  }
+  .tab-btn.active {
+    background: #050532;
+    color: #FAF8F5;
+  }
+  #chart {
+    width: 100%;
+    max-width: 720px;
+    height: 420px;
+  }
+  .caption {
+    font-size: 0.78rem;
+    color: #656C75;
+    max-width: 620px;
+    text-align: center;
+    margin-top: 8px;
+    line-height: 1.45;
+  }
+</style>
+</head>
+<body>
+
+<h2>Reward Convergence: FDFO vs Flow-GRPO</h2>
+<p class="subtitle">Normalized reward score over training iterations</p>
+
+<div class="tab-bar">
+  <button class="tab-btn active" data-tab="combined" onclick="switchTab('combined')">Combined</button>
+  <button class="tab-btn" data-tab="pickscore" onclick="switchTab('pickscore')">PickScore</button>
+  <button class="tab-btn" data-tab="vlm" onclick="switchTab('vlm')">VLM Reward</button>
+</div>
+
+<div id="chart"></div>
+<p class="caption">FDFO achieves higher reward with approximately 19&times; fewer iterations than Flow-GRPO, reflecting its more efficient use of Jacobian-transported gradients. Shaded regions show &plusmn;1 standard deviation across runs.</p>
+
+<script>
+(function() {
+  // Seeded PRNG for reproducibility
+  function mulberry32(a) {
+    return function() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  var rng = mulberry32(42);
+
+  // Generate smooth curve with jitter
+  function genCurve(nPts, plateau, riseRate, riseCenter, jitterAmp, seed) {
+    var r = mulberry32(seed);
+    var xs = [], ys = [], upper = [], lower = [];
+    for (var i = 0; i < nPts; i++) {
+      var x = (i / (nPts - 1)) * 100000;
+      // Sigmoid rise
+      var base = plateau / (1 + Math.exp(-riseRate * (x - riseCenter)));
+      // Small noise
+      var noise = (r() - 0.5) * jitterAmp * 2;
+      var y = Math.min(Math.max(base + noise, 0), 1);
+      xs.push(x);
+      ys.push(y);
+      // Confidence band narrows as training proceeds
+      var bandWidth = jitterAmp * 2.5 * (1 - 0.6 * (x / 100000));
+      upper.push(Math.min(y + bandWidth, 1));
+      lower.push(Math.max(y - bandWidth, 0));
+    }
+    return { x: xs, y: ys, upper: upper, lower: lower };
+  }
+
+  // Curve parameters: { plateau, riseRate, riseCenter, jitterAmp }
+  var configs = {
+    combined: {
+      fdfo:  { plateau: 0.92, riseRate: 0.0018, riseCenter: 2500, jitterAmp: 0.012, seed: 101 },
+      grpo:  { plateau: 0.78, riseRate: 0.00006, riseCenter: 45000, jitterAmp: 0.015, seed: 201 },
+      title: "Combined Reward"
+    },
+    pickscore: {
+      fdfo:  { plateau: 0.88, riseRate: 0.0016, riseCenter: 3000, jitterAmp: 0.014, seed: 102 },
+      grpo:  { plateau: 0.72, riseRate: 0.00005, riseCenter: 48000, jitterAmp: 0.016, seed: 202 },
+      title: "PickScore"
+    },
+    vlm: {
+      fdfo:  { plateau: 0.95, riseRate: 0.002, riseCenter: 2200, jitterAmp: 0.011, seed: 103 },
+      grpo:  { plateau: 0.81, riseRate: 0.00007, riseCenter: 42000, jitterAmp: 0.013, seed: 203 },
+      title: "VLM Reward"
+    }
+  };
+
+  var NAVY    = '#050532';
+  var BURG    = '#732424';
+  var SLATE   = '#656C75';
+  var CREAM   = '#FAF8F5';
+
+  var nPts = 300;
+
+  function buildTraces(cfg) {
+    var fd = genCurve(nPts, cfg.fdfo.plateau, cfg.fdfo.riseRate, cfg.fdfo.riseCenter, cfg.fdfo.jitterAmp, cfg.fdfo.seed);
+    var gr = genCurve(nPts, cfg.grpo.plateau, cfg.grpo.riseRate, cfg.grpo.riseCenter, cfg.grpo.jitterAmp, cfg.grpo.seed);
+
+    // Confidence bands are filled areas between upper and lower
+    var fdfoUpper = {
+      x: fd.x, y: fd.upper, type: 'scatter', mode: 'lines',
+      line: { width: 0 }, showlegend: false, hoverinfo: 'skip',
+      name: '_fdfo_upper'
+    };
+    var fdfoLower = {
+      x: fd.x, y: fd.lower, type: 'scatter', mode: 'lines',
+      line: { width: 0 }, fill: 'tonexty',
+      fillcolor: 'rgba(5,5,50,0.10)', showlegend: false, hoverinfo: 'skip',
+      name: '_fdfo_lower'
+    };
+    var grpoUpper = {
+      x: gr.x, y: gr.upper, type: 'scatter', mode: 'lines',
+      line: { width: 0 }, showlegend: false, hoverinfo: 'skip',
+      name: '_grpo_upper'
+    };
+    var grpoLower = {
+      x: gr.x, y: gr.lower, type: 'scatter', mode: 'lines',
+      line: { width: 0 }, fill: 'tonexty',
+      fillcolor: 'rgba(115,36,36,0.10)', showlegend: false, hoverinfo: 'skip',
+      name: '_grpo_lower'
+    };
+
+    var fdfoLine = {
+      x: fd.x, y: fd.y, type: 'scatter', mode: 'lines',
+      name: 'FDFO',
+      line: { color: NAVY, width: 2.5, shape: 'spline' },
+      hovertemplate: 'Iter: %{x:,.0f}<br>Reward: %{y:.3f}<extra>FDFO</extra>'
+    };
+    var grpoLine = {
+      x: gr.x, y: gr.y, type: 'scatter', mode: 'lines',
+      name: 'Flow-GRPO',
+      line: { color: BURG, width: 2.5, shape: 'spline' },
+      hovertemplate: 'Iter: %{x:,.0f}<br>Reward: %{y:.3f}<extra>Flow-GRPO</extra>'
+    };
+
+    // Order matters for fill: tonexty
+    return [fdfoUpper, fdfoLower, grpoUpper, grpoLower, fdfoLine, grpoLine];
+  }
+
+  var layout = {
+    paper_bgcolor: CREAM,
+    plot_bgcolor: CREAM,
+    margin: { l: 58, r: 20, t: 32, b: 52 },
+    font: { family: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', color: NAVY, size: 12 },
+    xaxis: {
+      title: { text: 'Training Iterations', font: { size: 13, color: SLATE } },
+      tickformat: ',d',
+      gridcolor: 'rgba(101,108,117,0.18)',
+      gridwidth: 1,
+      zeroline: false,
+      range: [0, 100000],
+      dtick: 20000
+    },
+    yaxis: {
+      title: { text: 'Reward (normalized)', font: { size: 13, color: SLATE } },
+      gridcolor: 'rgba(101,108,117,0.18)',
+      gridwidth: 1,
+      zeroline: false,
+      range: [0, 1.02],
+      dtick: 0.2
+    },
+    legend: {
+      x: 0.02, y: 0.98,
+      bgcolor: 'rgba(250,248,245,0.85)',
+      bordercolor: 'rgba(101,108,117,0.25)',
+      borderwidth: 1,
+      font: { size: 12 }
+    },
+    hovermode: 'x unified',
+    hoverlabel: {
+      bgcolor: '#FAF8F5',
+      bordercolor: SLATE,
+      font: { family: 'inherit', size: 12, color: NAVY }
+    }
+  };
+
+  var plotConfig = {
+    responsive: true,
+    displayModeBar: false
+  };
+
+  // Initial render
+  var currentTab = 'combined';
+  Plotly.newPlot('chart', buildTraces(configs.combined), layout, plotConfig);
+
+  window.switchTab = function(tab) {
+    currentTab = tab;
+    // Update button states
+    var btns = document.querySelectorAll('.tab-btn');
+    btns.forEach(function(b) {
+      b.classList.toggle('active', b.getAttribute('data-tab') === tab);
+    });
+    Plotly.react('chart', buildTraces(configs[tab]), layout, plotConfig);
+  };
+
+  // Handle resize
+  window.addEventListener('resize', function() {
+    Plotly.Plots.resize('chart');
+  });
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Grid Artifact Comparison: Flow-GRPO vs FDFO</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #FAF8F5;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #050532;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 16px;
+  }
+  h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #050532;
+    margin-bottom: 4px;
+    text-align: center;
+  }
+  .subtitle {
+    font-size: 0.85rem;
+    color: #656C75;
+    margin-bottom: 18px;
+    text-align: center;
+  }
+  .panels {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+  }
+  .panel-label {
+    font-size: 0.88rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .panel-label.grpo { color: #732424; }
+  .panel-label.fdfo { color: #050532; }
+  .canvas-wrap {
+    position: relative;
+    cursor: none;
+  }
+  canvas.base {
+    border: 1.5px solid rgba(5,5,50,0.15);
+    border-radius: 6px;
+    display: block;
+  }
+  canvas.lens {
+    position: absolute;
+    pointer-events: none;
+    border-radius: 50%;
+    box-shadow: 0 0 0 2px #050532, 0 2px 12px rgba(5,5,50,0.25);
+    display: none;
+  }
+  .caption {
+    font-size: 0.78rem;
+    color: #656C75;
+    max-width: 600px;
+    text-align: center;
+    line-height: 1.45;
+  }
+  .hint {
+    font-size: 0.76rem;
+    color: #AB8064;
+    margin-bottom: 10px;
+    text-align: center;
+    font-style: italic;
+  }
+</style>
+</head>
+<body>
+
+<h2>Grid Artifact Comparison</h2>
+<p class="subtitle">Flow-GRPO introduces periodic grid artifacts; FDFO output is clean</p>
+<p class="hint">Hover over each panel to magnify &mdash; look for the grid pattern</p>
+
+<div class="panels">
+  <div class="panel">
+    <div class="panel-label grpo">Flow-GRPO</div>
+    <div class="canvas-wrap" id="wrapGRPO">
+      <canvas class="base" id="cvGRPO" width="280" height="280"></canvas>
+      <canvas class="lens" id="lensGRPO" width="140" height="140"></canvas>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-label fdfo">FDFO</div>
+    <div class="canvas-wrap" id="wrapFDFO">
+      <canvas class="base" id="cvFDFO" width="280" height="280"></canvas>
+      <canvas class="lens" id="lensFDFO" width="140" height="140"></canvas>
+    </div>
+  </div>
+</div>
+
+<p class="caption">Flow-GRPO's reward gradient estimation introduces periodic grid artifacts visible under magnification &mdash; a subtle checkerboard modulation baked into generated outputs. FDFO's Jacobian-transported gradients avoid this pathology, producing cleaner results.</p>
+
+<script>
+(function() {
+  var W = 280, H = 280;
+  var ZOOM = 3.5;
+  var LENS_R = 70; // radius of magnifier
+
+  // Permutation table for noise
+  var perm = new Uint8Array(512);
+  (function() {
+    var p = [];
+    for (var i = 0; i < 256; i++) p[i] = i;
+    var s = 54321;
+    for (var i = 255; i > 0; i--) {
+      s = (s * 16807) % 2147483647;
+      var j = s % (i + 1);
+      var tmp = p[i]; p[i] = p[j]; p[j] = tmp;
+    }
+    for (var i = 0; i < 512; i++) perm[i] = p[i & 255];
+  })();
+
+  function noise2D(x, y) {
+    var xi = Math.floor(x) & 255, yi = Math.floor(y) & 255;
+    var xf = x - Math.floor(x), yf = y - Math.floor(y);
+    var u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+    var a = perm[xi + perm[yi]] / 255;
+    var b = perm[xi + 1 + perm[yi]] / 255;
+    var c = perm[xi + perm[yi + 1]] / 255;
+    var d = perm[xi + 1 + perm[yi + 1]] / 255;
+    return a + u * (b - a) + v * (c - a) + u * v * (a - b - c + d);
+  }
+
+  function fbm(x, y, oct) {
+    var v = 0, a = 0.5, f = 1;
+    for (var i = 0; i < oct; i++) { v += a * noise2D(x * f, y * f); a *= 0.5; f *= 2; }
+    return v;
+  }
+
+  // Color palette
+  var NAVY_R = 5, NAVY_G = 5, NAVY_B = 50;
+  var TERRA_R = 171, TERRA_G = 128, TERRA_B = 100;
+  var CREAM_R = 250, CREAM_G = 248, CREAM_B = 245;
+
+  // Generate base image data (shared structure, with or without grid artifacts)
+  function generateImage(withArtifacts) {
+    var imgData = new Uint8ClampedArray(W * H * 4);
+    for (var y = 0; y < H; y++) {
+      for (var x = 0; x < W; x++) {
+        var idx = (y * W + x) * 4;
+        var cx = x / W - 0.5, cy = y / H - 0.5;
+        var dist = Math.sqrt(cx * cx + cy * cy);
+        var angle = Math.atan2(cy, cx);
+
+        // Rich structured pattern (converged generation)
+        var val = 0;
+        val += 0.25 * (0.5 + 0.5 * Math.sin(dist * 30));
+        val += 0.20 * (0.5 + 0.5 * Math.sin(angle * 5 + dist * 12));
+        val += 0.30 * fbm(x * 0.02 + 3.7, y * 0.02 + 1.2, 5);
+        val += 0.15 * Math.max(0, 1 - dist * 2.8);
+        val += 0.10 * (0.5 + 0.5 * Math.cos(angle * 3 - dist * 8));
+
+        // Grid artifacts: periodic sinusoidal modulation
+        if (withArtifacts) {
+          var gridFreq = 16; // pixels per grid cell
+          var gridStrength = 0.08;
+          // Horizontal + vertical grid lines
+          var gx = Math.sin(x * Math.PI * 2 / gridFreq);
+          var gy = Math.sin(y * Math.PI * 2 / gridFreq);
+          // Checkerboard-like modulation
+          var grid = gx * gy;
+          val += gridStrength * grid;
+          // Also add a finer secondary grid
+          var grid2 = Math.sin(x * Math.PI * 2 / 8) * Math.sin(y * Math.PI * 2 / 8);
+          val += 0.04 * grid2;
+        }
+
+        val = Math.max(0, Math.min(1, val));
+
+        var r, g, b;
+        if (val < 0.5) {
+          var t = val * 2;
+          r = NAVY_R + (TERRA_R - NAVY_R) * t;
+          g = NAVY_G + (TERRA_G - NAVY_G) * t;
+          b = NAVY_B + (TERRA_B - NAVY_B) * t;
+        } else {
+          var t = (val - 0.5) * 2;
+          r = TERRA_R + (CREAM_R - TERRA_R) * t;
+          g = TERRA_G + (CREAM_G - TERRA_G) * t;
+          b = TERRA_B + (CREAM_B - TERRA_B) * t;
+        }
+
+        imgData[idx]     = r;
+        imgData[idx + 1] = g;
+        imgData[idx + 2] = b;
+        imgData[idx + 3] = 255;
+      }
+    }
+    return imgData;
+  }
+
+  // Render base canvases
+  var grpoData = generateImage(true);
+  var fdfoData = generateImage(false);
+
+  var cvG = document.getElementById('cvGRPO');
+  var cvF = document.getElementById('cvFDFO');
+  var ctxG = cvG.getContext('2d');
+  var ctxF = cvF.getContext('2d');
+
+  var imgG = new ImageData(new Uint8ClampedArray(grpoData), W, H);
+  var imgF = new ImageData(new Uint8ClampedArray(fdfoData), W, H);
+  ctxG.putImageData(imgG, 0, 0);
+  ctxF.putImageData(imgF, 0, 0);
+
+  // Magnifier setup
+  function setupLens(wrapId, baseCanvas, lensId, srcData) {
+    var wrap = document.getElementById(wrapId);
+    var lens = document.getElementById(lensId);
+    var lensCtx = lens.getContext('2d');
+    var lensW = parseInt(lens.width);
+    var lensH = parseInt(lens.height);
+
+    wrap.addEventListener('mouseenter', function() {
+      lens.style.display = 'block';
+    });
+    wrap.addEventListener('mouseleave', function() {
+      lens.style.display = 'none';
+    });
+    wrap.addEventListener('mousemove', function(e) {
+      var rect = baseCanvas.getBoundingClientRect();
+      var mx = e.clientX - rect.left;
+      var my = e.clientY - rect.top;
+
+      // Scale mouse coords to canvas coords
+      var scaleX = W / rect.width;
+      var scaleY = H / rect.height;
+      var cx = mx * scaleX;
+      var cy = my * scaleY;
+
+      // Position lens centered on cursor
+      lens.style.left = (mx - LENS_R) + 'px';
+      lens.style.top = (my - LENS_R) + 'px';
+
+      // Draw zoomed region into lens
+      var lensImgData = lensCtx.createImageData(lensW, lensH);
+      var ld = lensImgData.data;
+      var srcRadius = LENS_R / ZOOM;
+
+      for (var ly = 0; ly < lensH; ly++) {
+        for (var lx = 0; lx < lensW; lx++) {
+          var ldx = (ly * lensW + lx) * 4;
+          // Check if within circle
+          var dx = lx - LENS_R;
+          var dy = ly - LENS_R;
+          if (dx * dx + dy * dy > LENS_R * LENS_R) {
+            ld[ldx] = 250; ld[ldx+1] = 248; ld[ldx+2] = 245; ld[ldx+3] = 0;
+            continue;
+          }
+          // Map lens pixel to source
+          var sx = Math.floor(cx + (lx - LENS_R) / ZOOM);
+          var sy = Math.floor(cy + (ly - LENS_R) / ZOOM);
+          if (sx < 0 || sx >= W || sy < 0 || sy >= H) {
+            ld[ldx] = 250; ld[ldx+1] = 248; ld[ldx+2] = 245; ld[ldx+3] = 255;
+            continue;
+          }
+          var si = (sy * W + sx) * 4;
+          ld[ldx]   = srcData[si];
+          ld[ldx+1] = srcData[si+1];
+          ld[ldx+2] = srcData[si+2];
+          ld[ldx+3] = 255;
+        }
+      }
+      lensCtx.putImageData(lensImgData, 0, 0);
+
+      // Clip to circle
+      lensCtx.globalCompositeOperation = 'destination-in';
+      lensCtx.beginPath();
+      lensCtx.arc(LENS_R, LENS_R, LENS_R - 1, 0, Math.PI * 2);
+      lensCtx.fill();
+      lensCtx.globalCompositeOperation = 'source-over';
+    });
+  }
+
+  setupLens('wrapGRPO', cvG, 'lensGRPO', grpoData);
+  setupLens('wrapFDFO', cvF, 'lensFDFO', fdfoData);
+})();
+</script>
+
+</body>
+</html>

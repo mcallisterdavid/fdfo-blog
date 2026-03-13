@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Quality Progression: FDFO vs Flow-GRPO</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #FAF8F5;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #050532;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 16px;
+  }
+  h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #050532;
+    margin-bottom: 4px;
+    text-align: center;
+  }
+  .subtitle {
+    font-size: 0.85rem;
+    color: #656C75;
+    margin-bottom: 18px;
+    text-align: center;
+  }
+  .panels {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .panel-label {
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #050532;
+    margin-bottom: 6px;
+  }
+  .panel-label.grpo { color: #732424; }
+  canvas {
+    border: 1.5px solid rgba(5,5,50,0.15);
+    border-radius: 6px;
+  }
+  .slider-container {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 10px;
+    width: 100%;
+    max-width: 580px;
+  }
+  .slider-label {
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: #656C75;
+    white-space: nowrap;
+  }
+  .epoch-value {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #050532;
+    min-width: 28px;
+    text-align: right;
+  }
+  input[type="range"] {
+    flex: 1;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 3px;
+    background: linear-gradient(to right, #050532 0%, #AB8064 100%);
+    outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #050532;
+    border: 2px solid #FAF8F5;
+    box-shadow: 0 1px 4px rgba(5,5,50,0.3);
+    cursor: pointer;
+  }
+  input[type="range"]::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: #050532;
+    border: 2px solid #FAF8F5;
+    box-shadow: 0 1px 4px rgba(5,5,50,0.3);
+    cursor: pointer;
+  }
+  .play-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  .play-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: 1.5px solid #050532;
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s;
+  }
+  .play-btn:hover { background: rgba(5,5,50,0.06); }
+  .play-btn svg { fill: #050532; }
+  .caption {
+    font-size: 0.78rem;
+    color: #656C75;
+    max-width: 580px;
+    text-align: center;
+    line-height: 1.45;
+  }
+</style>
+</head>
+<body>
+
+<h2>Image Quality Over Training</h2>
+<p class="subtitle">Procedural noise &rarr; structured pattern progression</p>
+
+<div class="panels">
+  <div class="panel">
+    <div class="panel-label">FDFO</div>
+    <canvas id="cvFDFO" width="260" height="260"></canvas>
+  </div>
+  <div class="panel">
+    <div class="panel-label grpo">Flow-GRPO</div>
+    <canvas id="cvGRPO" width="260" height="260"></canvas>
+  </div>
+</div>
+
+<div class="play-row">
+  <button class="play-btn" id="playBtn" onclick="togglePlay()">
+    <svg id="playIcon" width="14" height="16" viewBox="0 0 14 16"><polygon points="2,1 13,8 2,15"/></svg>
+    <svg id="pauseIcon" width="14" height="16" viewBox="0 0 14 16" style="display:none"><rect x="1" y="1" width="4" height="14"/><rect x="9" y="1" width="4" height="14"/></svg>
+  </button>
+  <div class="slider-container">
+    <span class="slider-label">Training Epoch</span>
+    <input type="range" id="epochSlider" min="0" max="100" value="0">
+    <span class="epoch-value" id="epochVal">0</span>
+  </div>
+</div>
+
+<p class="caption">FDFO converges to clean structure faster while preserving style consistency. Flow-GRPO converges more slowly and exhibits visible color drift (style drift) at later epochs.</p>
+
+<script>
+(function() {
+  var W = 260, H = 260;
+  var cvF = document.getElementById('cvFDFO');
+  var cvG = document.getElementById('cvGRPO');
+  var ctxF = cvF.getContext('2d');
+  var ctxG = cvG.getContext('2d');
+  var slider = document.getElementById('epochSlider');
+  var epochVal = document.getElementById('epochVal');
+
+  // Simplex-like noise using permutation table
+  var perm = new Uint8Array(512);
+  (function initPerm() {
+    var p = [];
+    for (var i = 0; i < 256; i++) p[i] = i;
+    // Fisher-Yates with seeded RNG
+    var s = 12345;
+    for (var i = 255; i > 0; i--) {
+      s = (s * 16807 + 0) % 2147483647;
+      var j = s % (i + 1);
+      var tmp = p[i]; p[i] = p[j]; p[j] = tmp;
+    }
+    for (var i = 0; i < 512; i++) perm[i] = p[i & 255];
+  })();
+
+  // Simple 2D value noise with smooth interpolation
+  function noise2D(x, y) {
+    var xi = Math.floor(x) & 255;
+    var yi = Math.floor(y) & 255;
+    var xf = x - Math.floor(x);
+    var yf = y - Math.floor(y);
+    // Smoothstep
+    var u = xf * xf * (3 - 2 * xf);
+    var v = yf * yf * (3 - 2 * yf);
+    var a = perm[xi + perm[yi]] / 255;
+    var b = perm[xi + 1 + perm[yi]] / 255;
+    var c = perm[xi + perm[yi + 1]] / 255;
+    var d = perm[xi + 1 + perm[yi + 1]] / 255;
+    return a + u * (b - a) + v * (c - a) + u * v * (a - b - c + d);
+  }
+
+  // Multi-octave fractal noise
+  function fbm(x, y, octaves) {
+    var val = 0, amp = 0.5, freq = 1;
+    for (var i = 0; i < octaves; i++) {
+      val += amp * noise2D(x * freq, y * freq);
+      amp *= 0.5;
+      freq *= 2;
+    }
+    return val;
+  }
+
+  // Seeded random for grain noise
+  function mulberry32(a) {
+    return function() {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  // Color palette
+  var NAVY_R = 5, NAVY_G = 5, NAVY_B = 50;
+  var TERRA_R = 171, TERRA_G = 128, TERRA_B = 100;
+  var CREAM_R = 250, CREAM_G = 248, CREAM_B = 245;
+
+  function renderPanel(ctx, epoch, isGRPO) {
+    // Effective progress: FDFO converges ~4x faster
+    var progress;
+    if (isGRPO) {
+      // Slower sigmoid — only reaches ~0.7 structure by epoch 100
+      progress = 1 / (1 + Math.exp(-0.06 * (epoch - 55)));
+    } else {
+      // Fast sigmoid — nearly full structure by epoch 40
+      progress = 1 / (1 + Math.exp(-0.12 * (epoch - 20)));
+    }
+
+    var imgData = ctx.createImageData(W, H);
+    var data = imgData.data;
+    var rng = mulberry32(epoch * 1000 + (isGRPO ? 7777 : 3333));
+
+    // Style drift for GRPO: hue shifts as epochs increase
+    var driftR = 0, driftG = 0, driftB = 0;
+    if (isGRPO && epoch > 20) {
+      var driftAmt = Math.min((epoch - 20) / 80, 1) * 0.35;
+      // Shift toward warm reddish tint
+      driftR = driftAmt * 40;
+      driftG = -driftAmt * 15;
+      driftB = -driftAmt * 25;
+    }
+
+    for (var y = 0; y < H; y++) {
+      for (var x = 0; x < W; x++) {
+        var idx = (y * W + x) * 4;
+
+        // Structured pattern: concentric rings + radial features
+        var cx = x / W - 0.5;
+        var cy = y / H - 0.5;
+        var dist = Math.sqrt(cx * cx + cy * cy);
+        var angle = Math.atan2(cy, cx);
+
+        // Multi-scale structured pattern
+        var structure = 0;
+        // Radial rings
+        structure += 0.3 * (0.5 + 0.5 * Math.sin(dist * 28));
+        // Angular petals
+        structure += 0.25 * (0.5 + 0.5 * Math.sin(angle * 6 + dist * 10));
+        // Fractal detail
+        structure += 0.25 * fbm(x * 0.025, y * 0.025, 4);
+        // Center glow
+        structure += 0.2 * Math.max(0, 1 - dist * 3);
+
+        structure = Math.max(0, Math.min(1, structure));
+
+        // Random noise
+        var grain = rng();
+
+        // Blend: progress 0 = all noise, progress 1 = all structure
+        var val = progress * structure + (1 - progress) * grain;
+
+        // Map to palette: dark navy <-> cream with terracotta mid
+        var r, g, b;
+        if (val < 0.5) {
+          var t = val * 2;
+          r = NAVY_R + (TERRA_R - NAVY_R) * t;
+          g = NAVY_G + (TERRA_G - NAVY_G) * t;
+          b = NAVY_B + (TERRA_B - NAVY_B) * t;
+        } else {
+          var t = (val - 0.5) * 2;
+          r = TERRA_R + (CREAM_R - TERRA_R) * t;
+          g = TERRA_G + (CREAM_G - TERRA_G) * t;
+          b = TERRA_B + (CREAM_B - TERRA_B) * t;
+        }
+
+        // Apply drift
+        r = Math.max(0, Math.min(255, r + driftR));
+        g = Math.max(0, Math.min(255, g + driftG));
+        b = Math.max(0, Math.min(255, b + driftB));
+
+        data[idx]     = r;
+        data[idx + 1] = g;
+        data[idx + 2] = b;
+        data[idx + 3] = 255;
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+  }
+
+  function render(epoch) {
+    renderPanel(ctxF, epoch, false);
+    renderPanel(ctxG, epoch, true);
+    epochVal.textContent = epoch;
+  }
+
+  slider.addEventListener('input', function() {
+    render(parseInt(this.value));
+  });
+
+  // Play/pause animation
+  var playing = false;
+  var animFrame = null;
+  var lastTime = 0;
+  var INTERVAL = 80; // ms per epoch step
+
+  function animStep(ts) {
+    if (!playing) return;
+    if (ts - lastTime >= INTERVAL) {
+      lastTime = ts;
+      var v = parseInt(slider.value);
+      if (v >= 100) {
+        stopPlay();
+        return;
+      }
+      slider.value = v + 1;
+      render(v + 1);
+    }
+    animFrame = requestAnimationFrame(animStep);
+  }
+
+  function stopPlay() {
+    playing = false;
+    document.getElementById('playIcon').style.display = '';
+    document.getElementById('pauseIcon').style.display = 'none';
+    if (animFrame) cancelAnimationFrame(animFrame);
+  }
+
+  window.togglePlay = function() {
+    if (playing) {
+      stopPlay();
+    } else {
+      playing = true;
+      document.getElementById('playIcon').style.display = 'none';
+      document.getElementById('pauseIcon').style.display = '';
+      if (parseInt(slider.value) >= 100) slider.value = 0;
+      lastTime = 0;
+      animFrame = requestAnimationFrame(animStep);
+    }
+  };
+
+  // Initial render
+  render(0);
+})();
+</script>
+
+</body>
+</html>
