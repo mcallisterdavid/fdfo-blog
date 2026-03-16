@@ -1,4 +1,12 @@
 source 'https://rubygems.org'
+# Ruby 4.0 compatibility: gems removed from default stdlib
+gem 'ostruct'
+gem 'logger'
+gem 'bigdecimal'
+gem 'csv'
+gem 'base64'
+gem 'mutex_m'
+
 group :jekyll_plugins do
     gem 'classifier-reborn'
     gem 'jekyll'

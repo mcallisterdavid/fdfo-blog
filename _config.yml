@@ -201,6 +201,7 @@ exclude:
   - README.md
   - readme_preview/
   - vendor
+  - assets/jupyter/ # excluded: jupyter CLI not installed locally
 keep_files:
   - CNAME
   - .nojekyll

@@ -15,7 +15,7 @@ body{font-family:Arial,sans-serif;background:#fff}
 #fg{position:absolute;top:0;left:0;width:100%;height:100%}
 .srow{display:flex;align-items:center;justify-content:center;gap:12px;margin:12px auto 0;max-width:480px}
 .srow label{font:bold 13px Arial;color:#050532;white-space:nowrap}
-.srow .v{color:#050532;min-width:24px;text-align:right}
+.srow .v{color:#050532;min-width:36px;text-align:right}
 input[type=range]{flex:1;height:5px;border-radius:5px;background:#ddd;outline:none;-webkit-appearance:none}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#050532;cursor:pointer}
 input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:#050532;cursor:pointer;border:none}
@@ -33,7 +33,7 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
     <div class="loading" id="loadMsg">Rendering tree...</div>
   </div>
   <div class="srow">
-    <label>Step: <span class="v" id="stepVal"></span>/<span id="stepMax"></span></label>
+    <label>t = <span class="v" id="stepVal">0.00</span></label>
     <input type="range" id="stepSlider" min="0" max="200" value="0" step="1">
   </div>
   <div class="cap">
@@ -1061,10 +1061,15 @@ function onUp(){
 // ================================================================
 // Controls
 // ================================================================
+function stepFToT(f){
+  // Map continuous slider position [0, N_STEPS] to ODE timestep [0, 1]
+  const tS=0.01, tE=0.995;
+  return tS+(f/N_STEPS)*(tE-tS);
+}
 function syncSlider(){
   const slider=document.getElementById('stepSlider');
   slider.value=Math.round(viewStepF/N_STEPS*SLIDER_RES);
-  document.getElementById('stepVal').textContent=viewStepF.toFixed(1);
+  document.getElementById('stepVal').textContent=stepFToT(viewStepF).toFixed(2);
 }
 
 // ================================================================
@@ -1088,9 +1093,8 @@ function setup(){
   initFg();
   integrateODE();
 
-  // Set step labels to match N_STEPS
-  document.getElementById('stepVal').textContent='0.0';
-  document.getElementById('stepMax').textContent=N_STEPS;
+  // Set initial timestep label
+  document.getElementById('stepVal').textContent='0.01';
 
   render();
 
@@ -1103,7 +1107,7 @@ function setup(){
 
   document.getElementById('stepSlider').addEventListener('input',function(e){
     viewStepF=parseInt(e.target.value)/SLIDER_RES*N_STEPS;
-    document.getElementById('stepVal').textContent=viewStepF.toFixed(1);
+    document.getElementById('stepVal').textContent=stepFToT(viewStepF).toFixed(2);
     // Pause auto-animation when user manually scrubs
     pauseAutoForInteraction();
     render();
