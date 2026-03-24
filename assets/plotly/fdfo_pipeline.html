@@ -6,27 +6,28 @@
 <title>FDFO Generation Pipeline</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
   body {
-    background: #FAF8F5;
+    background: #fff;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     color: #050532;
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: 20px 12px;
+    padding: 2px 12px 2px;
     overflow-x: hidden;
   }
   h2 {
     font-size: 1.25rem;
     font-weight: 600;
     color: #050532;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
     text-align: center;
   }
   .subtitle {
     font-size: 0.85rem;
     color: #656C75;
-    margin-bottom: 16px;
+    margin-bottom: 4px;
     text-align: center;
   }
   .pipeline-wrap {
@@ -34,31 +35,12 @@
     max-width: 840px;
     overflow-x: auto;
     overflow-y: visible;
-    margin-bottom: 14px;
+    margin-bottom: 0;
     -webkit-overflow-scrolling: touch;
   }
   .pipeline-wrap::-webkit-scrollbar { height: 4px; }
   .pipeline-wrap::-webkit-scrollbar-thumb { background: rgba(5,5,50,0.15); border-radius: 2px; }
   svg#pipeline { display: block; margin: 0 auto; }
-  .play-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    padding: 8px 22px;
-    border: 1.5px solid #050532;
-    border-radius: 22px;
-    background: transparent;
-    color: #050532;
-    font-size: 0.85rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s;
-    font-family: inherit;
-    margin-bottom: 12px;
-  }
-  .play-btn:hover { background: rgba(5,5,50,0.06); }
-  .play-btn.running { background: #050532; color: #FAF8F5; }
-  .play-btn svg { fill: currentColor; width: 13px; height: 13px; }
   .caption {
     font-size: 0.78rem;
     color: #656C75;
@@ -100,16 +82,9 @@
 <p class="subtitle">Noise &rarr; denoising steps &rarr; clean sample &rarr; reward</p>
 
 <div class="pipeline-wrap">
-  <svg id="pipeline" xmlns="http://www.w3.org/2000/svg" width="840" height="270" viewBox="0 0 840 270"></svg>
+  <svg id="pipeline" xmlns="http://www.w3.org/2000/svg" width="840" height="156" viewBox="0 0 840 156"></svg>
 </div>
 
-<button class="play-btn" id="playBtn">
-  <svg viewBox="0 0 24 24" id="playIcon"><polygon points="5,3 19,12 5,21"/></svg>
-  <svg viewBox="0 0 24 24" id="pauseIcon" style="display:none"><rect x="5" y="3" width="5" height="18"/><rect x="14" y="3" width="5" height="18"/></svg>
-  <span id="btnLabel">Animate Flow</span>
-</button>
-
-<p class="caption">The generation pipeline transports Gaussian noise x<sub>0</sub> through T denoising steps via learned velocity fields, producing a clean sample x<sub>1</sub>. A reward model then scores the output. FDFO backpropagates through the full Jacobian chain.</p>
 
 <div class="tooltip-box" id="tooltip"></div>
 
@@ -128,7 +103,7 @@
 
   // ---- Stage definitions ----
   var BOX_H = 66;
-  var BOX_Y = 88;
+  var BOX_Y = 42;
   var R = 8; // corner radius
 
   var stages = [
@@ -356,170 +331,9 @@
     x: (gradLeft + gradRight) / 2, y: gradY - 8,
     'text-anchor': 'middle', 'font-size': '10', fill: TERRA,
     'font-weight': '600', 'letter-spacing': '0.3',
-    textContent: 'JACOBIAN-TRANSPORTED GRADIENT (FDFO)'
+    textContent: 'REWARD REINFORCEMENT UPDATE'
   }));
 
-  // ---- Particle for animation ----
-  var particleGroup = el('g', { opacity: '0' });
-  var particleGlow = el('circle', { r: 13, fill: 'none', stroke: BURG, 'stroke-width': '1', opacity: '0.4' });
-  var particleBody = el('circle', { r: 7, fill: CREAM, stroke: BURG, 'stroke-width': '2' });
-  // Noise dots inside particle
-  var particleNoiseG = el('g');
-  for (var n = 0; n < 6; n++) {
-    var a = (n / 6) * Math.PI * 2;
-    particleNoiseG.appendChild(el('circle', { cx: 3.5 * Math.cos(a), cy: 3.5 * Math.sin(a), r: 1, fill: SLATE }));
-  }
-  particleGroup.appendChild(particleGlow);
-  particleGroup.appendChild(particleBody);
-  particleGroup.appendChild(particleNoiseG);
-  svg.appendChild(particleGroup);
-
-  // ---- Animation logic ----
-  // Build waypoints: center of each non-dots stage
-  var waypoints = [];
-  for (var i = 0; i < stages.length; i++) {
-    if (stages[i].id === 'dots') continue;
-    waypoints.push({ x: xPos[i] + stages[i].w / 2, y: midY, stageIdx: i });
-  }
-
-  var DWELL = 350;  // ms at each stage
-  var TRAVEL = 450; // ms between stages
-  var totalDur = waypoints.length * DWELL + (waypoints.length - 1) * TRAVEL;
-
-  var animRunning = false;
-  var animStart = 0;
-  var animRaf = null;
-
-  function easeInOut(t) { return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; }
-
-  function setHighlight(activeStageIdx) {
-    for (var i = 0; i < stageGroups.length; i++) {
-      if (!stageGroups[i]) continue;
-      var rect = stageGroups[i].querySelector('rect');
-      if (!rect) continue;
-      if (i === activeStageIdx) {
-        rect.setAttribute('stroke', TERRA);
-        rect.setAttribute('stroke-width', '2.5');
-      } else {
-        rect.setAttribute('stroke', 'none');
-        rect.removeAttribute('stroke-width');
-      }
-    }
-  }
-
-  function clearHighlights() {
-    for (var i = 0; i < stageGroups.length; i++) {
-      if (!stageGroups[i]) continue;
-      var rect = stageGroups[i].querySelector('rect');
-      if (rect) { rect.setAttribute('stroke', 'none'); rect.removeAttribute('stroke-width'); }
-    }
-  }
-
-  function animTick(ts) {
-    if (!animRunning) return;
-    if (!animStart) animStart = ts;
-    var elapsed = ts - animStart;
-
-    if (elapsed >= totalDur) {
-      // Done
-      var last = waypoints[waypoints.length - 1];
-      particleGroup.setAttribute('transform', 'translate(' + last.x + ',' + last.y + ')');
-      particleGroup.setAttribute('opacity', '1');
-      particleNoiseG.setAttribute('opacity', '0');
-      particleGlow.setAttribute('opacity', '0.2');
-      setHighlight(last.stageIdx);
-      setTimeout(function() {
-        particleGroup.setAttribute('opacity', '0');
-        clearHighlights();
-        animRunning = false;
-        document.getElementById('playIcon').style.display = '';
-        document.getElementById('pauseIcon').style.display = 'none';
-        document.getElementById('playBtn').classList.remove('running');
-        document.getElementById('btnLabel').textContent = 'Animate Flow';
-      }, 700);
-      return;
-    }
-
-    // Determine position along waypoints
-    var cumTime = 0;
-    var wpIdx = 0;
-    var traveling = false;
-    var travelFrac = 0;
-
-    for (var i = 0; i < waypoints.length; i++) {
-      if (elapsed < cumTime + DWELL) {
-        wpIdx = i;
-        traveling = false;
-        break;
-      }
-      cumTime += DWELL;
-      if (i < waypoints.length - 1) {
-        if (elapsed < cumTime + TRAVEL) {
-          wpIdx = i;
-          traveling = true;
-          travelFrac = (elapsed - cumTime) / TRAVEL;
-          break;
-        }
-        cumTime += TRAVEL;
-      }
-      wpIdx = i;
-    }
-
-    var px, py;
-    if (traveling) {
-      var w1 = waypoints[wpIdx];
-      var w2 = waypoints[wpIdx + 1];
-      var ef = easeInOut(travelFrac);
-      px = w1.x + (w2.x - w1.x) * ef;
-      py = w1.y + (w2.y - w1.y) * ef;
-    } else {
-      px = waypoints[wpIdx].x;
-      py = waypoints[wpIdx].y;
-    }
-
-    // Noise level decreases through denoising (first 5 waypoints: noise, s1, s2, sT = indices 0-3 in waypoints after removing dots)
-    var denoiseEnd = 4; // waypoint index where denoising ends (step T)
-    var noiseLevel;
-    if (wpIdx < denoiseEnd) {
-      var prog = wpIdx / denoiseEnd;
-      if (traveling && wpIdx < denoiseEnd) prog = (wpIdx + travelFrac) / denoiseEnd;
-      noiseLevel = Math.max(0, 1 - prog);
-    } else {
-      noiseLevel = 0;
-    }
-
-    particleGroup.setAttribute('transform', 'translate(' + px + ',' + py + ')');
-    particleGroup.setAttribute('opacity', '1');
-    particleNoiseG.setAttribute('opacity', String(noiseLevel));
-    particleGlow.setAttribute('r', String(13 + 5 * noiseLevel));
-    particleGlow.setAttribute('opacity', String(0.2 + 0.35 * noiseLevel));
-
-    var activeIdx = traveling ? (travelFrac > 0.5 ? waypoints[Math.min(wpIdx + 1, waypoints.length - 1)].stageIdx : waypoints[wpIdx].stageIdx) : waypoints[wpIdx].stageIdx;
-    setHighlight(activeIdx);
-
-    animRaf = requestAnimationFrame(animTick);
-  }
-
-  document.getElementById('playBtn').addEventListener('click', function() {
-    if (animRunning) {
-      animRunning = false;
-      cancelAnimationFrame(animRaf);
-      particleGroup.setAttribute('opacity', '0');
-      clearHighlights();
-      document.getElementById('playIcon').style.display = '';
-      document.getElementById('pauseIcon').style.display = 'none';
-      this.classList.remove('running');
-      document.getElementById('btnLabel').textContent = 'Animate Flow';
-      return;
-    }
-    animRunning = true;
-    animStart = 0;
-    this.classList.add('running');
-    document.getElementById('playIcon').style.display = 'none';
-    document.getElementById('pauseIcon').style.display = '';
-    document.getElementById('btnLabel').textContent = 'Stop';
-    animRaf = requestAnimationFrame(animTick);
-  });
 })();
 </script>
 

@@ -3,26 +3,21 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Jacobian Gradient Transport — Fractal Tree</title>
+<title>Backprop vs Copy Gradient — Fractal Tree</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;overflow:hidden}
 body{font-family:Arial,sans-serif;background:#fff}
 .wrap{height:100%;display:flex;flex-direction:column;align-items:center;padding:0 12px 6px}
-.cbox{flex:0 0 auto;width:100%;aspect-ratio:1.4/1;max-height:calc(100vh - 100px);border-radius:16px;overflow:hidden;background:#FAF8F5;cursor:crosshair;position:relative}
+.cbox{flex:0 0 auto;width:100%;aspect-ratio:1.4/1;max-height:calc(100vh - 120px);border-radius:16px;overflow:hidden;background:#FAF8F5;cursor:crosshair;position:relative}
 #bg,#fg{border-radius:16px}
 #bg{position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:auto}
 #fg{position:absolute;top:0;left:0;width:100%;height:100%}
-.srow{display:flex;align-items:center;justify-content:center;gap:12px;margin:12px auto 0;max-width:480px}
-.srow label{font:bold 13px Arial;color:#050532;white-space:nowrap}
-.srow .v{color:#050532;min-width:36px;text-align:right}
-input[type=range]{flex:1;height:5px;border-radius:5px;background:#ddd;outline:none;-webkit-appearance:none}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#050532;cursor:pointer}
-input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:#050532;cursor:pointer;border:none}
 .cap{text-align:center;margin-top:10px;color:#656C75;font-size:13px;line-height:1.5}
-.cap a{color:#050532;cursor:pointer;text-decoration:underline}
+.legend-row{display:flex;align-items:center;justify-content:center;gap:20px;margin:8px auto 0;font:bold 12px Arial}
+.legend-swatch{display:inline-block;width:22px;height:3px;border-radius:2px;vertical-align:middle;margin-right:4px}
 .loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font:bold 16px Arial;color:#050532}
-@media(max-width:600px){.wrap{padding:0 8px 4px}.cap{font-size:11px}input[type=range]::-webkit-slider-thumb{width:26px;height:26px}}
+@media(max-width:600px){.wrap{padding:0 8px 4px}.cap{font-size:11px}.legend-row{font-size:10px;gap:12px}}
 </style>
 </head>
 <body>
@@ -30,107 +25,92 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
   <div class="cbox" id="box">
     <canvas id="bg"></canvas>
     <canvas id="fg"></canvas>
-    <div class="loading" id="loadMsg">Rendering tree...</div>w
+    <div class="loading" id="loadMsg">Rendering tree...</div>
   </div>
-  <div class="srow">
-    <label>t = <span class="v" id="stepVal">0.00</span></label>
-    <input type="range" id="stepSlider" min="0" max="200" value="0" step="1">
+  <div class="legend-row">
+    <span><span class="legend-swatch" style="background:#050532"></span><span style="color:#050532">Backprop (J&#7488;&middot;&#8711;R)</span></span>
+    <span><span class="legend-swatch" style="background:#1A7A6D"></span><span style="color:#1A7A6D">Copy gradient</span></span>
+    <span style="color:#656C75">&#916;&#952; = angle between them</span>
   </div>
   <div class="cap">
-    The reward gradient is transported backward through the sampling chain via the Jacobian of each step.
-    <b>Click</b> to reposition the noise sample, <b>drag the dial</b> to rotate the gradient direction.
-    <a id="resumeLink" style="display:none" onclick="resumeAuto()">Resume animation</a>
+    Backpropagated gradients are rotated and scaled by the Jacobian at each step.
+    The copy gradient simply reuses &#8711;R everywhere.
+    <b>Click</b> to reposition, <b>drag the dial</b> to rotate &#8711;R.
   </div>
 </div>
 
 <script>
 // ================================================================
-// Style constants — edit these to tune colors, sizes, and weights
+// Style constants
 // ================================================================
-// Note: CSS above uses the same palette (search for hex codes to match).
 const STYLE = {
-  // ── Color palette ──
-  bg:        '#FAF8F5',           // cream paper background
-  bgRGB:     [250, 248, 245],    // same in RGB
-  navyRGB:   [5, 5, 50],         // trunk & deep branches
-  navyHex:   '#050532',          // navy as hex (labels, text)
-  tipsRGB:   [85, 64, 50],    // branch tips (warm terracotta)
-  pathRGB:   [192, 112, 90],     // sampling chain (reddish terracotta)
-  pathHex:   '#C0705A',          // same in hex
-  burgundy:  '#732424',          // reward gradient, play button accent
-  grey:      '#656C75',          // captions, inactive elements
-  greyRGB:   [101, 108, 117],    // same in RGB
+  // -- Color palette --
+  bg:        '#FAF8F5',
+  bgRGB:     [250, 248, 245],
+  navyRGB:   [5, 5, 50],
+  navyHex:   '#050532',
+  tipsRGB:   [85, 64, 50],
+  pathRGB:   [192, 112, 90],
+  pathHex:   '#C0705A',
+  burgundy:  '#732424',
+  grey:      '#656C75',
+  greyRGB:   [101, 108, 117],
 
-  // ── Angle-deviation color stops (used by aC function) ──
-  // 0 deg = navyRGB, 45 deg = angleMidRGB, 90 deg = angleBadRGB
-  angleMidRGB: [5, 5, 50],  // moderate deviation (= tipsRGB)
-  angleBadRGB: [5, 5, 50],    // severe deviation (burgundy-ish)
+  // -- Copy gradient color -- teal/dark green
+  copyRGB:   [26, 122, 109],
+  copyHex:   '#1A7A6D',
 
-  // ── Tree: glow pass (wide soft outer strokes) ──
+  // -- Angle-deviation color stops for backprop arrows --
+  angleMidRGB: [5, 5, 50],
+  angleBadRGB: [5, 5, 50],
+
+  // -- Tree: glow pass --
   glowBase: 22, glowDecay: 0.60, glowFloor: 4,
   glowAlpha: 0.05, glowAlphaDecay: 0.72, glowAlphaFloor: 0.02,
 
-  // ── Tree: mid-glow pass (medium body strokes) ──
+  // -- Tree: mid-glow pass --
   midBase: 6, midDecay: 0.60, midFloor: 3,
   midAlpha: 0.13, midAlphaDecay: 0.75, midAlphaFloor: 0.04,
 
-  // ── Tree: taper pass (filled quads, crisp core) ──
+  // -- Tree: taper pass --
   taperWidth: 12.0, taperDecay: 0.68,
   taperFloorBase: 1.4, taperFloorTip: 0.9,
   taperAlpha: 0.95, taperAlphaStep: 0.06, taperAlphaFloor: 0.55,
 
-  // ── Tree: highlight pass (bright center line) ──
+  // -- Tree: highlight pass --
   hlWidth: 1.5, hlDecay: 0.55, hlFloor: 0.3,
   hlAlpha: 0.15, hlAlphaDecay: 0.6, hlMaxDepth: 5,
 
-  // ── Sampling path ──
+  // -- Sampling path --
   pathShadowW: 4, pathShadowAlpha: 0.5,
   pathDimAlpha: 1.0, pathDimW: 5,
-  pathActiveAlpha: 1.0, pathActiveW: 5.5,
   chevronSize: 2, chevronHalf: 0.3,
-  chevronActiveAlpha: 0.55, chevronInactiveAlpha: 0.2,
+  chevronActiveAlpha: 0.55,
   dotOuterR: 5, dotInnerR: 3.5,
-  cursorOuterR: 7, cursorInnerR: 5, cursorRingW: 2,
   x0HandleR: 14,
 
-  // ── Gradient arrows ──
-  arrowFrac: 0.045,   // arrow length as fraction of view width
-  heroScale: 1.5,     // hero arrow = arrowLen * this
+  // -- Gradient arrows --
+  arrowFrac: 0.045,
   trailW: 1.8, trailHead: 7,
-  trailAlpha: 0.2, trailAlphaFade: 0, trailAlphaFloor: 0.8,
-  heroW: 3.5, heroHead: 12, heroShadowW: 6, heroShadowHead: 14,
+  trailAlphaFloor: 0.8,
+  copyTrailW: 1.5, copyTrailHead: 6,
 
-  // ── Legend (gradient dial, top-right) ──
+  // -- Angle label --
+  angleLabelFont: 'bold 13px Arial',
+  angleLabelOffset: 8,
+
+  // -- Legend (gradient dial, top-right) --
   legendR: 36, legendMargin: 20, legendArrow: 24,
   legendHeadSize: 10, legendHeadHalf: 0.45,
   legendShaftW: 2.5, legendHitPad: 12,
 
-  // ── View padding & aspect ratio ──
-  canvasAR: 1.4,      // width:height of plot (1 = square, >1 = landscape)
-  padLoFrac: 0.06,    // padding below/left of origin
-  padHiFrac: 0.42,    // padding above/right (room for noise sample)
-  initX0: [0.72, 0.68], // initial noise sample position (fraction of span)
-
-  // ── Auto-animation timing ──
-  forwardDuration: 3.0,   // seconds for forward sampling phase
-  backwardDuration: 4.5,  // seconds for backward wave to traverse the full chain
-  holdDuration: 1.0,      // seconds to hold all arrows visible at full size
-  fadeDuration: 0.8,      // seconds for all arrows to fade out together
-  pauseDuration: 0.5,     // seconds after fade before restarting forward
-
-  // ── Backward wave shape ──
-  // The wave front sweeps from N_STEPS down to 0.
-  // waveFrontWidth controls how many steps are in the "growing" transition zone.
-  // Arrows behind the front: fully grown. At the front: growing. Ahead: invisible.
-  waveFrontWidth: 3.0,    // number of steps the growth transition spans
-
-  // ── Dotted hint line (forward phase) ──
-  hintDash: [4, 8],       // dash pattern for hint line
-  hintAlpha: 0.15,        // opacity of hint line
-  hintWidth: 1.5,         // stroke width of hint line
+  // -- View padding & aspect ratio --
+  canvasAR: 1.4,
+  padLoFrac: 0.06,
+  padHiFrac: 0.42,
+  initX0: [0.72, 0.68],
 };
 
-// Helper: format [r,g,b] array + alpha into CSS rgba string
 function rgba(rgb, a){ return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`; }
 
 // ================================================================
@@ -140,10 +120,10 @@ function mb32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>1
 function mkGauss(rng){return function(){const u=rng(),v=rng();return Math.sqrt(-2*Math.log(u+1e-12))*Math.cos(6.2832*v)}}
 
 // ================================================================
-// Build fractal tree distribution (autoguidance style)
+// Build fractal tree distribution
 // ================================================================
-const COMPS=[];  // {mu:[2], S:[[2x2]], Sinv:[[2x2]], det:f, phi:f, cls:str}
-const BRANCHES=[]; // {x0,y0,x1,y1,depth,cls} — branch segments in data coords (scaled)
+const COMPS=[];
+const BRANCHES=[];
 
 function buildTree(){
   const rng=mb32(2);
@@ -156,11 +136,10 @@ function buildTree(){
     const cdx=Math.cos(angle),cdy=Math.sin(angle);
     const distR=gauss()*0.2+1;
     const dist=0.292*Math.pow(0.8,depth)*distR;
-    const thick=Math.min(0.2*Math.pow(0.8,depth)/dist, 0.999); // clamp to avoid degenerate covariance
+    const thick=Math.min(0.2*Math.pow(0.8,depth)/dist, 0.999);
     const sz0=scale[0]*dist*0.06, sz1=scale[1]*dist*0.06;
     const phi=dist*Math.pow(0.5,depth);
 
-    // Store branch segment for vector rendering
     BRANCHES.push({
       x0:pos[0]*scale[0], y0:pos[1]*scale[1],
       x1:(pos[0]+cdx*dist)*scale[0], y1:(pos[1]+cdy*dist)*scale[1],
@@ -171,8 +150,6 @@ function buildTree(){
       const t=0.07+(0.93-0.07)*i/7;
       const mx=(pos[0]+cdx*dist*t)*scale[0];
       const my=(pos[1]+cdy*dist*t)*scale[1];
-      // Covariance: S = dir*dir^T * (sz^2 - thick^2*sz^2) + thick^2*sz^2 * I
-      // This creates an ellipse elongated along the branch direction
       const a00=sz0*sz0, a11=sz1*sz1;
       const b00=thick*thick*a00, b11=thick*thick*a11;
       const S00=cdx*cdx*(a00-b00)+b00;
@@ -203,7 +180,7 @@ function buildTree(){
 buildTree();
 
 // ================================================================
-// View bounds — top-right quadrant only (branch A)
+// View bounds
 // ================================================================
 const ORIGIN_SX=0.0030*1.3136, ORIGIN_SY=0.0325*1.3844;
 let VX0=ORIGIN_SX,VX1=-Infinity,VY0=ORIGIN_SY,VY1=-Infinity;
@@ -213,23 +190,18 @@ for(const c of COMPS){
   VX1=Math.max(VX1,c.mu[0]+r);
   VY1=Math.max(VY1,c.mu[1]+r);
 }
-// Small padding below/left of origin so trunk isn't clipped
 const padLo=STYLE.padLoFrac*Math.max(VX1-VX0,VY1-VY0);
 VX0-=padLo; VY0-=padLo;
-// Padding on the top/right — tree fills ~65% of canvas,
-// leaving room in the upper-right for the initial noise sample.
 const padHi=STYLE.padHiFrac*Math.max(VX1-VX0,VY1-VY0);
 VX1+=padHi; VY1+=padHi;
-// Make square base, then extend horizontally for landscape aspect ratio
 const span=Math.max(VX1-VX0,VY1-VY0);
 VX1=VX0+span; VY1=VY0+span;
 if(STYLE.canvasAR>1){
-  // Extend rightward — more room in the noise region
   VX1=VX0+span*STYLE.canvasAR;
 }
 
 // ================================================================
-// Spatial index for fast component lookup
+// Spatial index
 // ================================================================
 const GRID_CELLS=32;
 const spatialGrid=new Array(GRID_CELLS*GRID_CELLS);
@@ -266,9 +238,9 @@ function nearbyComps(x,y,extraR){
 }
 
 // ================================================================
-// Vector rendering of fractal tree on background canvas
+// Vector rendering of fractal tree
 // ================================================================
-const MAX_DEPTH=6; // max depth is 6 (recurse stops at depth>=7)
+const MAX_DEPTH=6;
 
 function branchRGB(depth){
   const t=depth/MAX_DEPTH;
@@ -297,13 +269,11 @@ function renderVectorTree(){
   const scX=bW/(VX1-VX0), scY=bH/(VY1-VY0);
   function toP(dx,dy){return[(dx-VX0)*scX,(VY1-dy)*scY];}
 
-  // Sort branches: deepest first so trunk paints over tips
   const sorted=BRANCHES.slice().sort((a,b)=>b.depth-a.depth);
-
   ctx.lineCap='round';
   ctx.lineJoin='round';
 
-  // === Pass 1: wide soft glow strokes for density envelope ===
+  // Pass 1: wide soft glow
   for(const br of sorted){
     const[px0,py0]=toP(br.x0,br.y0);
     const[px1,py1]=toP(br.x1,br.y1);
@@ -315,7 +285,7 @@ function renderVectorTree(){
     ctx.beginPath();ctx.moveTo(px0,py0);ctx.lineTo(px1,py1);ctx.stroke();
   }
 
-  // === Pass 2: medium glow for body ===
+  // Pass 2: medium glow
   for(const br of sorted){
     const[px0,py0]=toP(br.x0,br.y0);
     const[px1,py1]=toP(br.x1,br.y1);
@@ -327,7 +297,7 @@ function renderVectorTree(){
     ctx.beginPath();ctx.moveTo(px0,py0);ctx.lineTo(px1,py1);ctx.stroke();
   }
 
-  // === Pass 3: tapered filled branch shapes (crisp core) ===
+  // Pass 3: tapered filled branch shapes
   for(const br of sorted){
     const[px0,py0]=toP(br.x0,br.y0);
     const[px1,py1]=toP(br.x1,br.y1);
@@ -352,7 +322,7 @@ function renderVectorTree(){
     ctx.fill();
   }
 
-  // === Pass 4: thin bright highlight along branch centers ===
+  // Pass 4: thin bright highlight
   for(const br of sorted){
     if(br.depth>STYLE.hlMaxDepth)continue;
     const[px0,py0]=toP(br.x0,br.y0);
@@ -366,7 +336,7 @@ function renderVectorTree(){
 }
 
 // ================================================================
-// Flow matching ODE — variance-exploding (VE) schedule
+// Flow matching ODE -- VE schedule
 // ================================================================
 const N_STEPS=12;
 const SIGMA_MAX=0.7;
@@ -374,10 +344,9 @@ const SIGMA2=SIGMA_MAX*SIGMA_MAX;
 
 function flowVelocity(x,y,t){
   const tc=Math.max(1e-5,Math.min(1-1e-5,t));
-  const omt=1-tc; // (1-t)
-  const noiseVar=omt*omt*SIGMA2; // (1-t)^2 * sigma^2
+  const omt=1-tc;
+  const noiseVar=omt*omt*SIGMA2;
 
-  // Search radius depends on noise level
   const nearby=nearbyComps(x,y,Math.sqrt(noiseVar)*3);
 
   let sumW=0, Ex=0, Ey=0;
@@ -429,7 +398,6 @@ function flowVelocity(x,y,t){
 // ================================================================
 let odePath=[];
 let odeJacs=[];
-// Initial noise sample — upper-right of view (noisy region, away from data)
 let x0=[VX0+(VX1-VX0)*STYLE.initX0[0], VY0+span*STYLE.initX0[1]];
 
 function integrateODE(){
@@ -470,47 +438,12 @@ function integrateODE(){
 }
 
 // ================================================================
-// Interpolation helpers for smooth slider
-// ================================================================
-function lerpPos(f){
-  const lo=Math.floor(f), hi=Math.min(lo+1,N_STEPS);
-  const a=f-lo;
-  return[
-    odePath[lo].pos[0]*(1-a)+odePath[hi].pos[0]*a,
-    odePath[lo].pos[1]*(1-a)+odePath[hi].pos[1]*a
-  ];
-}
-function lerpJac(f){
-  const lo=Math.floor(f), hi=Math.min(lo+1,N_STEPS);
-  const a=f-lo;
-  const A=odeJacs[lo], B=odeJacs[hi];
-  return[
-    [A[0][0]*(1-a)+B[0][0]*a, A[0][1]*(1-a)+B[0][1]*a],
-    [A[1][0]*(1-a)+B[1][0]*a, A[1][1]*(1-a)+B[1][1]*a]
-  ];
-}
-
-// ================================================================
 // State
 // ================================================================
 let fgCanvas,fgCtx,W,H,dpr;
 let gradAngle=Math.PI*0.6;
-let viewStepF=0; // float in [0, N_STEPS]
 let isDrag=false, dragTarget=null;
-let isDraggingX0=false; // true while user is actively dragging the x0 handle
-const isMobile=window.innerWidth<=600;
-const SLIDER_RES=200; // slider range is 0..SLIDER_RES
-
-// ================================================================
-// Auto-animation state
-// ================================================================
-let autoPlaying=true;
-let animPhase='forward'; // 'forward' | 'backward' | 'hold' | 'fade' | 'pause'
-let animStartTime=0;     // performance.now() when this phase started
-let backpropPos=0;       // continuous float for backward wave front position (N_STEPS -> 0)
-let fadeAlpha=1;          // global alpha for all arrows during fade phase (1 -> 0)
-let lastInteractionTime=0; // for auto-resume after idle
-const AUTO_RESUME_DELAY=5000; // ms of idle before auto-resuming
+let isDraggingX0=false;
 
 // ================================================================
 // Coord mapping
@@ -528,7 +461,7 @@ const vn=v=>{const l=vl(v);return l>1e-15?[v[0]/l,v[1]/l]:[1,0]};
 const vd=(a,b)=>a[0]*b[0]+a[1]*b[1];
 const aVec=(a,b)=>Math.acos(Math.max(-1,Math.min(1,vd(vn(a),vn(b)))));
 
-// Color interpolation for angle deviation
+// Color interpolation for angle deviation (backprop arrows)
 function aC(deg){
   const t=Math.min(Math.abs(deg)/90,1);
   const n=STYLE.navyRGB, m=STYLE.angleMidRGB, b=STYLE.angleBadRGB;
@@ -554,8 +487,31 @@ function arrow(x1,y1,x2,y2,col,lw,hs){
   fgCtx.closePath();fgCtx.fill();
 }
 
+// Draw an angle arc between two direction vectors at a given pixel position
+function drawAngleArc(cx,cy,dir1,dir2,radius,col,alpha){
+  const a1=Math.atan2(-dir1[1],dir1[0]); // screen angle (y flipped in data->pixel)
+  const a2=Math.atan2(-dir2[1],dir2[0]);
+  // Find the signed angle difference
+  let diff=a2-a1;
+  while(diff>Math.PI)diff-=2*Math.PI;
+  while(diff<-Math.PI)diff+=2*Math.PI;
+  if(Math.abs(diff)<0.02)return; // too small to draw
+
+  fgCtx.strokeStyle=col;
+  fgCtx.lineWidth=1.2;
+  fgCtx.globalAlpha=alpha;
+  fgCtx.beginPath();
+  if(diff>0){
+    fgCtx.arc(cx,cy,radius,a1,a1+diff,false);
+  } else {
+    fgCtx.arc(cx,cy,radius,a1+diff,a1,false);
+  }
+  fgCtx.stroke();
+  fgCtx.globalAlpha=1;
+}
+
 // ================================================================
-// Render foreground (path + arrows)
+// Render foreground (path + arrows) -- fully static, always visible
 // ================================================================
 function render(){
   if(!fgCtx)return;
@@ -567,72 +523,27 @@ function render(){
   const gDir=[Math.cos(gradAngle),Math.sin(gradAngle)];
   const arrowLen=(VX1-VX0)*STYLE.arrowFrac;
 
-  // Current continuous position
-  const curF=viewStepF;
-  const curPos=lerpPos(curF);
-
-  // Determine which arrows to show based on animation phase
-  const inBackward=(animPhase==='backward');
-  const inHold=(animPhase==='hold');
-  const inFade=(animPhase==='fade');
-  const now=performance.now();
-
-  // -- Path rendering --
-  const isForwardAuto=(animPhase==='forward'&&autoPlaying);
-  if(isForwardAuto){
-    // During forward phase: draw the full ODE trajectory as a dotted hint line
-    fgCtx.strokeStyle=rgba(STYLE.pathRGB, STYLE.hintAlpha);
-    fgCtx.lineWidth=STYLE.hintWidth;
-    fgCtx.setLineDash(STYLE.hintDash);
-    fgCtx.lineCap='round';fgCtx.lineJoin='round';
-    fgCtx.beginPath();
-    for(let s=0;s<=N_STEPS;s++){
-      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
-      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
-    }
-    fgCtx.stroke();
-    fgCtx.setLineDash([]);
-  } else {
-    // Backward/pause/manual: full path shadow + full path
-    fgCtx.strokeStyle=rgba(STYLE.bgRGB, STYLE.pathShadowAlpha);fgCtx.lineWidth=STYLE.pathShadowW;
-    fgCtx.lineJoin='round';fgCtx.lineCap='round';
-    fgCtx.beginPath();
-    for(let s=0;s<=N_STEPS;s++){
-      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
-      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
-    }
-    fgCtx.stroke();
-
-    // Full path (dim terracotta)
-    fgCtx.strokeStyle=rgba(STYLE.pathRGB, STYLE.pathDimAlpha);fgCtx.lineWidth=STYLE.pathDimW;
-    fgCtx.beginPath();
-    for(let s=0;s<=N_STEPS;s++){
-      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
-      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
-    }
-    fgCtx.stroke();
+  // -- Full path: shadow --
+  fgCtx.strokeStyle=rgba(STYLE.bgRGB, STYLE.pathShadowAlpha);fgCtx.lineWidth=STYLE.pathShadowW;
+  fgCtx.lineJoin='round';fgCtx.lineCap='round';
+  fgCtx.beginPath();
+  for(let s=0;s<=N_STEPS;s++){
+    const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
   }
+  fgCtx.stroke();
 
-  // -- Active path (up to current continuous position, strong terracotta) --
-  {
-    const upTo=Math.floor(curF);
-    fgCtx.strokeStyle=rgba(STYLE.pathRGB, STYLE.pathActiveAlpha);fgCtx.lineWidth=STYLE.pathActiveW;
-    fgCtx.beginPath();
-    for(let s=0;s<=upTo;s++){
-      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
-      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
-    }
-    // Interpolate to exact current position
-    const[cpx2,cpy2]=d2p(curPos[0],curPos[1]);
-    if(upTo<N_STEPS) fgCtx.lineTo(cpx2,cpy2);
-    fgCtx.stroke();
+  // -- Full path: main stroke --
+  fgCtx.strokeStyle=rgba(STYLE.pathRGB, STYLE.pathDimAlpha);fgCtx.lineWidth=STYLE.pathDimW;
+  fgCtx.beginPath();
+  for(let s=0;s<=N_STEPS;s++){
+    const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
   }
+  fgCtx.stroke();
 
-  // -- Directional arrowheads along path segments --
+  // -- Directional chevrons along path segments --
   for(let s=0;s<N_STEPS;s++){
-    const active=s<curF;
-    // During forward auto phase, skip inactive chevrons (no dim path to attach to)
-    if(isForwardAuto&&!active)continue;
     const[px0,py0]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
     const[px1,py1]=d2p(odePath[s+1].pos[0],odePath[s+1].pos[1]);
     const mx=(px0+px1)/2, my=(py0+py1)/2;
@@ -640,7 +551,7 @@ function render(){
     const slen=Math.sqrt(sdx*sdx+sdy*sdy);
     if(slen<2)continue;
     const sa=Math.atan2(sdy,sdx);
-    const col=active?rgba(STYLE.pathRGB, STYLE.chevronActiveAlpha):rgba(STYLE.greyRGB, STYLE.chevronInactiveAlpha);
+    const col=rgba(STYLE.pathRGB, STYLE.chevronActiveAlpha);
     const sz=STYLE.chevronSize;
     const ha=STYLE.chevronHalf;
     fgCtx.fillStyle=col;
@@ -650,28 +561,17 @@ function render(){
     fgCtx.lineTo(mx-sz*Math.cos(sa+ha), my-sz*Math.sin(sa+ha));
     fgCtx.closePath();fgCtx.fill();
   }
-  // Start and end dots
+
+  // -- Start and end dots --
   for(const s of[0,N_STEPS]){
     const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
-    const active=s<=curF;
     fgCtx.fillStyle=STYLE.bg;
     fgCtx.beginPath();fgCtx.arc(px,py,STYLE.dotOuterR,0,6.2832);fgCtx.fill();
-    fgCtx.fillStyle=active?rgba(STYLE.pathRGB,0.5):rgba(STYLE.greyRGB,0.25);
+    fgCtx.fillStyle=rgba(STYLE.pathRGB,0.5);
     fgCtx.beginPath();fgCtx.arc(px,py,STYLE.dotInnerR,0,6.2832);fgCtx.fill();
   }
 
-  // -- Current position indicator (interpolated, terracotta) --
-  {
-    const[cpx,cpy]=d2p(curPos[0],curPos[1]);
-    fgCtx.fillStyle=STYLE.bg;
-    fgCtx.beginPath();fgCtx.arc(cpx,cpy,STYLE.cursorOuterR,0,6.2832);fgCtx.fill();
-    fgCtx.fillStyle=STYLE.pathHex;
-    fgCtx.beginPath();fgCtx.arc(cpx,cpy,STYLE.cursorInnerR,0,6.2832);fgCtx.fill();
-    fgCtx.strokeStyle=STYLE.pathHex;fgCtx.lineWidth=STYLE.cursorRingW;
-    fgCtx.beginPath();fgCtx.arc(cpx,cpy,STYLE.cursorOuterR,0,6.2832);fgCtx.stroke();
-  }
-
-  // -- x0 handle (dashed circle, terracotta) --
+  // -- x0 handle --
   {
     const[px,py]=d2p(x0[0],x0[1]);
     fgCtx.strokeStyle=rgba(STYLE.pathRGB,0.45);fgCtx.lineWidth=1.5;fgCtx.setLineDash([4,4]);
@@ -694,102 +594,19 @@ function render(){
     fgCtx.fillText('t\u2081 (data)',ex,ey+16);
   }
 
-  const[cpx,cpy]=d2p(curPos[0],curPos[1]);
+  // -- Gradient arrows at every step (uniform) --
+  for(let s=0;s<=N_STEPS;s++){
+    const[ppx,ppy]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    const pJ=odeJacs[s], pJT=m2T(pJ);
+    const pG=m2v(pJT,gDir);
+    const pDir=vn(pG);
+    const pDeg=aVec(pG,gDir)*180/Math.PI;
+    const dLen=arrowLen;
 
-  // -- Gradient arrows --
-  // Skip all gradient arrows while user is actively dragging x0
-  // During forward phase (auto): NO arrows at all
-  // During backward phase (auto): smooth wave grows arrows from data to noise
-  // During hold phase (auto): all arrows visible at full size
-  // During fade phase (auto): all arrows fade out simultaneously
-  // Manual mode (not autoPlaying): show all arrows as before
-  const curJ=lerpJac(curF), curJT=m2T(curJ);
-  const eG=m2v(curJT,gDir);
-  const eDir=vn(eG);
-  const aDeg=aVec(eG,gDir)*180/Math.PI;
-  const isAtEnd=(curF>=N_STEPS-0.01);
+    const baseAlpha=STYLE.trailAlphaFloor;
 
-  if(isDraggingX0){
-    // Dragging x0: no gradient arrows at all — just the path preview
-  } else if(isForwardAuto){
-    // Forward phase: no gradient arrows rendered
-  } else if((inBackward||inHold||inFade)&&autoPlaying){
-    // Backward wave / hold / fade phases
-    // During backward: wave front sweeps from N_STEPS to 0; arrows grow as front passes
-    // During hold: all arrows fully visible at full size
-    // During fade: all arrows fade out simultaneously
-    const globalFade=(inFade)?fadeAlpha:1;
-
-    for(let s=0;s<=N_STEPS;s++){
-      const[ppx,ppy]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
-      const pJ=odeJacs[s], pJT=m2T(pJ);
-      const pG=m2v(pJT,gDir);
-      const pDir=vn(pG);
-      const pDeg=aVec(pG,gDir)*180/Math.PI;
-      const col=s===N_STEPS?STYLE.burgundy:aC(pDeg);
-
-      // Compute growth factor for this arrow
-      let growFactor;
-      if(inHold||inFade){
-        // All arrows fully grown
-        growFactor=1;
-      } else {
-        // Backward phase: wave front is at backpropPos (sweeping from N_STEPS down to 0)
-        // The wave starts at the DATA end (high s) and sweeps toward NOISE (low s).
-        // Arrows at step s:
-        //   s < backpropPos - waveFrontWidth/2 : wave hasn't reached here yet -> invisible
-        //   s > backpropPos + waveFrontWidth/2 : wave already passed -> fully grown
-        //   in between: smoothly growing
-        const waveFront=backpropPos;
-        const halfW=STYLE.waveFrontWidth/2;
-        if(s<waveFront-halfW){
-          continue; // wave hasn't reached this step yet
-        } else if(s>=waveFront+halfW){
-          growFactor=1; // wave already passed — fully grown
-        } else {
-          // In the transition zone: interpolate
-          // s near (waveFront+halfW) = just passed -> nearly full
-          // s near (waveFront-halfW) = just being reached -> nearly zero
-          const t=(s-(waveFront-halfW))/STYLE.waveFrontWidth; // 0 at leading edge (just reached), 1 at trailing (fully passed)
-          growFactor=t*t*(3-2*t); // smoothstep
-          if(growFactor<0.02) continue; // too small to render
-        }
-      }
-
-      const curLen=arrowLen*growFactor;
-      const tx=odePath[s].pos[0]+pDir[0]*curLen;
-      const ty=odePath[s].pos[1]+pDir[1]*curLen;
-      const[tpx,tpy]=d2p(tx,ty);
-
-      const alpha=STYLE.trailAlphaFloor*growFactor*globalFade;
-      const lw=STYLE.trailW*Math.max(growFactor,0.3);
-      const hs=STYLE.trailHead*Math.max(growFactor,0.3);
-
-      fgCtx.globalAlpha=alpha;
-      if(growFactor>0.3){
-        arrow(ppx,ppy,tpx,tpy,col,lw,hs);
-      } else {
-        // Too small for arrowhead — shaft only
-        fgCtx.strokeStyle=col;fgCtx.lineWidth=lw;fgCtx.lineCap='round';
-        fgCtx.beginPath();fgCtx.moveTo(ppx,ppy);fgCtx.lineTo(tpx,tpy);fgCtx.stroke();
-      }
-      fgCtx.globalAlpha=1;
-    }
-  } else if(!autoPlaying){
-    // Manual mode: show all trail arrows + hero at current position
-    for(let s=0;s<=N_STEPS;s++){
-      if(Math.abs(s-curF)<0.5) continue;
-
-      const[ppx,ppy]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
-      const pJ=odeJacs[s], pJT=m2T(pJ);
-      const pG=m2v(pJT,gDir);
-      const pDir=vn(pG);
-      const pDeg=aVec(pG,gDir)*180/Math.PI;
-      const dLen=arrowLen;
-
-      const dist=Math.abs(s-curF);
-      const baseAlpha=Math.max(STYLE.trailAlphaFloor, STYLE.trailAlpha-dist*STYLE.trailAlphaFade);
-
+    // Backprop arrow
+    {
       const tx=odePath[s].pos[0]+pDir[0]*dLen, ty=odePath[s].pos[1]+pDir[1]*dLen;
       const[tpx,tpy]=d2p(tx,ty);
       fgCtx.globalAlpha=baseAlpha;
@@ -797,26 +614,52 @@ function render(){
       fgCtx.globalAlpha=1;
     }
 
-    // Current step: hero arrow
-    const bigLen=arrowLen*STYLE.heroScale;
-    const tx=curPos[0]+eDir[0]*bigLen;
-    const ty=curPos[1]+eDir[1]*bigLen;
-    const[tpx,tpy]=d2p(tx,ty);
-    const col=isAtEnd?STYLE.burgundy:aC(aDeg);
-    fgCtx.globalAlpha=0.5;
-    arrow(cpx,cpy,tpx,tpy,STYLE.bg,STYLE.heroShadowW,STYLE.heroShadowHead);
-    fgCtx.globalAlpha=1;
-    arrow(cpx,cpy,tpx,tpy,col,STYLE.heroW,STYLE.heroHead);
+    // Copy gradient arrow (skip at final step)
+    if(s<N_STEPS){
+      const tx=odePath[s].pos[0]+gDir[0]*dLen, ty=odePath[s].pos[1]+gDir[1]*dLen;
+      const[tpx,tpy]=d2p(tx,ty);
+      fgCtx.globalAlpha=baseAlpha*0.75;
+      arrow(ppx,ppy,tpx,tpy,STYLE.copyHex,STYLE.copyTrailW,STYLE.copyTrailHead);
+      fgCtx.globalAlpha=1;
+
+      // Angle arc + label
+      if(pDeg>1.5){
+        const arcR=Math.max(12, dLen*0.45);
+        drawAngleArc(ppx,ppy,pDir,gDir,arcR,STYLE.grey,0.45);
+
+        const screenA1=Math.atan2(-pDir[1],pDir[0]);
+        const screenA2=Math.atan2(-gDir[1],gDir[0]);
+        let diff=screenA2-screenA1;
+        while(diff>Math.PI)diff-=2*Math.PI;
+        while(diff<-Math.PI)diff+=2*Math.PI;
+        const midA=screenA1+diff/2;
+
+        const labelR=arcR+STYLE.angleLabelOffset+4;
+        const lx=ppx+Math.cos(midA)*labelR;
+        const ly=ppy+Math.sin(midA)*labelR;
+
+        fgCtx.globalAlpha=0.85;
+        fgCtx.font=STYLE.angleLabelFont;
+        fgCtx.textAlign='center';fgCtx.textBaseline='middle';
+        // White halo for readability over tree/arrows
+        fgCtx.strokeStyle='rgba(255,255,255,0.95)';
+        fgCtx.lineWidth=4;fgCtx.lineJoin='round';fgCtx.miterLimit=2;
+        fgCtx.strokeText(Math.round(pDeg)+'\u00B0',lx,ly);
+        fgCtx.fillStyle=STYLE.grey;
+        fgCtx.fillText(Math.round(pDeg)+'\u00B0',lx,ly);
+        fgCtx.globalAlpha=1;
+      }
+    }
   }
 
-  // -- Gradient direction legend (top-right, draggable) --
+  // -- Gradient direction legend (top-right) --
   drawGradLegend(fgCtx);
 
   fgCtx.restore();
 }
 
 // ================================================================
-// Gradient direction legend widget (top-right corner)
+// Gradient direction legend widget
 // ================================================================
 function legendCenter(){
   return[W-STYLE.legendMargin-STYLE.legendR, STYLE.legendMargin+STYLE.legendR];
@@ -825,13 +668,11 @@ function legendCenter(){
 function drawGradLegend(ctx){
   const[cx,cy]=legendCenter();
 
-  // Outer circle
   ctx.fillStyle=rgba(STYLE.bgRGB,0.85);
   ctx.strokeStyle=rgba(STYLE.navyRGB,0.25);
   ctx.lineWidth=1.5;
   ctx.beginPath();ctx.arc(cx,cy,STYLE.legendR,0,Math.PI*2);ctx.fill();ctx.stroke();
 
-  // Subtle tick marks at 0/90/180/270
   ctx.strokeStyle=rgba(STYLE.navyRGB,0.1);ctx.lineWidth=1;
   for(let i=0;i<4;i++){
     const a=i*Math.PI/2;
@@ -841,19 +682,16 @@ function drawGradLegend(ctx){
     ctx.stroke();
   }
 
-  // Gradient arrow — screen-space angle
   const sA=-gradAngle;
   const ax=Math.cos(sA)*STYLE.legendArrow, ay=Math.sin(sA)*STYLE.legendArrow;
   const tipX=cx+ax, tipY=cy+ay;
 
-  // Arrow shaft
   const hs=STYLE.legendHeadSize;
   const aa=Math.atan2(ay,ax);
   const shaftEndX=tipX-hs*0.6*Math.cos(aa), shaftEndY=tipY-hs*0.6*Math.sin(aa);
   ctx.strokeStyle=STYLE.burgundy;ctx.lineWidth=STYLE.legendShaftW;ctx.lineCap='round';
   ctx.beginPath();ctx.moveTo(cx-ax*0.3,cy-ay*0.3);ctx.lineTo(shaftEndX,shaftEndY);ctx.stroke();
 
-  // Arrowhead
   const ha=STYLE.legendHeadHalf;
   ctx.fillStyle=STYLE.burgundy;
   ctx.beginPath();ctx.moveTo(tipX,tipY);
@@ -861,12 +699,10 @@ function drawGradLegend(ctx){
   ctx.lineTo(tipX-hs*Math.cos(aa+ha),tipY-hs*Math.sin(aa+ha));
   ctx.closePath();ctx.fill();
 
-  // Label
   ctx.fillStyle=STYLE.burgundy;ctx.font='bold 11px Arial';
   ctx.textAlign='center';ctx.textBaseline='middle';
-  ctx.fillText('Reward Gradient',cx,cy+STYLE.legendR+12);
+  ctx.fillText('\u2207R',cx,cy+STYLE.legendR+12);
 
-  // Drag hint — subtle ring
   ctx.strokeStyle=rgba(STYLE.angleBadRGB,0.12);ctx.lineWidth=1;ctx.setLineDash([3,3]);
   ctx.beginPath();ctx.arc(cx,cy,STYLE.legendR+4,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);
 }
@@ -877,104 +713,7 @@ function hitLegend(mx,my){
 }
 
 // ================================================================
-// Auto-animation loop
-// ================================================================
-function startAnimation(){
-  restartForwardAnimation();
-}
-
-function resumeAuto(){
-  startAnimation();
-}
-
-function animationTick(now){
-  requestAnimationFrame(animationTick);
-
-  // Check for auto-resume after idle
-  if(!autoPlaying&&lastInteractionTime>0){
-    if(now-lastInteractionTime>AUTO_RESUME_DELAY){
-      lastInteractionTime=0;
-      startAnimation();
-    }
-  }
-
-  if(!autoPlaying){
-    render();
-    return;
-  }
-
-  const elapsed=(now-animStartTime)/1000;
-
-  if(animPhase==='forward'){
-    // Forward sampling: viewStepF goes from 0 to N_STEPS
-    const progress=Math.min(1, elapsed/STYLE.forwardDuration);
-    // Use ease-in-out for smoother motion
-    const eased=progress<0.5?2*progress*progress:1-Math.pow(-2*progress+2,2)/2;
-    viewStepF=eased*N_STEPS;
-    syncSlider();
-
-    if(progress>=1){
-      // Transition to backward phase
-      viewStepF=N_STEPS;
-      animPhase='backward';
-      animStartTime=now;
-      backpropPos=N_STEPS+STYLE.waveFrontWidth/2; // start with wave front just above N_STEPS
-    }
-  } else if(animPhase==='backward'){
-    // Backward gradient transport: smooth continuous wave
-    // backpropPos sweeps from N_STEPS down past 0 so the last arrows fully grow
-    const startPos=N_STEPS+STYLE.waveFrontWidth/2;
-    const endPos=-STYLE.waveFrontWidth/2; // sweep past 0 so all arrows finish growing
-    const progress=Math.min(1, elapsed/STYLE.backwardDuration);
-    // Use ease-in-out for smooth start/stop
-    const eased=progress<0.5?2*progress*progress:1-Math.pow(-2*progress+2,2)/2;
-    backpropPos=startPos+(endPos-startPos)*eased;
-
-    // Keep viewStepF at N_STEPS during backward (path stays fully drawn)
-    viewStepF=N_STEPS;
-    syncSlider();
-
-    if(progress>=1){
-      // Wave has fully passed — all arrows are grown. Transition to hold.
-      backpropPos=endPos;
-      animPhase='hold';
-      animStartTime=now;
-      fadeAlpha=1;
-    }
-  } else if(animPhase==='hold'){
-    // Brief pause with all arrows visible at full size
-    if(elapsed>=STYLE.holdDuration){
-      animPhase='fade';
-      animStartTime=now;
-      fadeAlpha=1;
-    }
-  } else if(animPhase==='fade'){
-    // All arrows fade out simultaneously
-    const progress=Math.min(1, elapsed/STYLE.fadeDuration);
-    // Use ease-out for a natural fade
-    fadeAlpha=1-progress*progress;
-
-    if(progress>=1){
-      fadeAlpha=0;
-      animPhase='pause';
-      animStartTime=now;
-    }
-  } else if(animPhase==='pause'){
-    if(elapsed>=STYLE.pauseDuration){
-      // Loop back to forward phase
-      animPhase='forward';
-      animStartTime=now;
-      viewStepF=0;
-      backpropPos=N_STEPS+STYLE.waveFrontWidth/2;
-      fadeAlpha=1;
-    }
-  }
-
-  render();
-}
-
-// ================================================================
-// Interaction (with rAF throttling for smooth dragging)
+// Interaction
 // ================================================================
 let rafPending=false;
 function cXY(e){
@@ -983,46 +722,17 @@ function cXY(e){
   const cy=(e.touches?e.touches[0].clientY:e.clientY);
   return[(cx-r.left)*W/r.width,(cy-r.top)*H/r.height];
 }
-function restartForwardAnimation(){
-  autoPlaying=true;
-  animPhase='forward';
-  animStartTime=performance.now();
-  viewStepF=0;
-  backpropPos=N_STEPS+STYLE.waveFrontWidth/2;
-  fadeAlpha=1;
-  document.getElementById('resumeLink').style.display='none';
-  syncSlider();
-}
-function pauseAutoForInteraction(){
-  autoPlaying=false;
-  lastInteractionTime=performance.now();
-  document.getElementById('resumeLink').style.display='inline';
-}
-function showFullPathImmediate(){
-  // During active x0 drag: show the full path with no arrows, no animation
-  autoPlaying=false;
-  animPhase='forward'; // doesn't matter much — isDraggingX0 suppresses arrows
-  viewStepF=N_STEPS;
-  backpropPos=N_STEPS+STYLE.waveFrontWidth/2;
-  fadeAlpha=1;
-  // Suppress auto-resume timer during drag
-  lastInteractionTime=0;
-  document.getElementById('resumeLink').style.display='none';
-  syncSlider();
-}
+
 function onDown(e){
   const[mx,my]=cXY(e);
   if(hitLegend(mx,my)){
     e.preventDefault();isDrag=true;dragTarget='grad';
-    // Do NOT pause; keep animation running (grad drag doesn't restart)
     onMove(e);return;
   }
   e.preventDefault();isDrag=true;dragTarget='x0';isDraggingX0=true;
   const[dx,dy]=p2d(mx,my);
   x0=[dx,dy];
   integrateODE();
-  // During drag: show full path immediately (no progressive animation, no arrows)
-  showFullPathImmediate();
   render();
 }
 function onMove(e){
@@ -1042,34 +752,13 @@ function onMove(e){
       const[ddx,ddy]=p2d(mx,my);
       x0=[ddx,ddy];
       integrateODE();
-      // During drag: show full path immediately (no progressive animation)
-      showFullPathImmediate();
       render();
     }
   });
 }
 function onUp(){
-  if(isDrag&&dragTarget==='x0'){
-    // User released after dragging x0 — clear drag flag, start forward animation
-    isDrag=false;dragTarget=null;isDraggingX0=false;
-    restartForwardAnimation();
-    return;
-  }
-  isDrag=false;dragTarget=null;
-}
-
-// ================================================================
-// Controls
-// ================================================================
-function stepFToT(f){
-  // Map continuous slider position [0, N_STEPS] to ODE timestep [0, 1]
-  const tS=0.01, tE=0.995;
-  return tS+(f/N_STEPS)*(tE-tS);
-}
-function syncSlider(){
-  const slider=document.getElementById('stepSlider');
-  slider.value=Math.round(viewStepF/N_STEPS*SLIDER_RES);
-  document.getElementById('stepVal').textContent=stepFToT(viewStepF).toFixed(2);
+  isDrag=false;dragTarget=null;isDraggingX0=false;
+  render();
 }
 
 // ================================================================
@@ -1092,10 +781,6 @@ function setup(){
 
   initFg();
   integrateODE();
-
-  // Set initial timestep label
-  document.getElementById('stepVal').textContent='0.01';
-
   render();
 
   fgCanvas.addEventListener('mousedown',onDown);
@@ -1105,20 +790,8 @@ function setup(){
   document.addEventListener('touchmove',onMove,{passive:false});
   document.addEventListener('touchend',onUp);
 
-  document.getElementById('stepSlider').addEventListener('input',function(e){
-    viewStepF=parseInt(e.target.value)/SLIDER_RES*N_STEPS;
-    document.getElementById('stepVal').textContent=stepFToT(viewStepF).toFixed(2);
-    // Pause auto-animation when user manually scrubs
-    pauseAutoForInteraction();
-    render();
-  });
-
   let rt;
   window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{renderVectorTree();initFg();render();},200);});
-
-  // Start the auto-animation loop
-  startAnimation();
-  requestAnimationFrame(animationTick);
 }
 
 requestAnimationFrame(()=>setTimeout(setup,50));

@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDP vs FDFO: How Updates Are Computed</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+            font-family: Arial, Helvetica, sans-serif;
+            background-color: #FAF8F5;
+            color: #050532;
+        }
+
+        .outer-wrapper {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            padding: 12px 16px 8px 16px;
+            box-sizing: border-box;
+        }
+
+        .title-block {
+            text-align: center;
+            margin-bottom: 6px;
+            flex-shrink: 0;
+        }
+
+        .title-block h2 {
+            margin: 0 0 2px 0;
+            font-size: 18px;
+            font-weight: 700;
+            color: #050532;
+            letter-spacing: -0.3px;
+        }
+
+        .title-block .subtitle {
+            margin: 0;
+            font-size: 12px;
+            color: #656C75;
+            line-height: 1.3;
+        }
+
+        .panels-row {
+            display: flex;
+            gap: 14px;
+            flex: 1;
+            min-height: 0;
+        }
+
+        .panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            border: 1.5px solid #e0ddd8;
+            border-radius: 10px;
+            overflow: hidden;
+            background: #FAF8F5;
+        }
+
+        .panel-header {
+            text-align: center;
+            padding: 6px 8px 4px 8px;
+            flex-shrink: 0;
+            border-bottom: 1px solid #e0ddd8;
+            background: #f5f2ed;
+        }
+
+        .panel-header h3 {
+            margin: 0;
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .panel-header .panel-desc {
+            margin: 2px 0 0 0;
+            font-size: 10.5px;
+            color: #656C75;
+            line-height: 1.3;
+        }
+
+        .panel-left .panel-header h3 { color: #732424; }
+        .panel-right .panel-header h3 { color: #1A7A6D; }
+
+        .viz-container {
+            position: relative;
+            flex: 1;
+            min-height: 0;
+        }
+
+        .viz-container .plotly-div {
+            width: 100%;
+            height: 100%;
+        }
+
+        .viz-container canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+
+        .bottom-bar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            padding: 6px 0 2px 0;
+            flex-shrink: 0;
+        }
+
+        .replay-btn {
+            background: #050532;
+            color: #FAF8F5;
+            border: none;
+            border-radius: 6px;
+            padding: 5px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            letter-spacing: 0.3px;
+        }
+
+        .replay-btn:hover {
+            background: #1a1a4e;
+        }
+
+        .caption {
+            font-size: 10.5px;
+            color: #656C75;
+            text-align: center;
+            line-height: 1.4;
+            max-width: 620px;
+        }
+
+        @media (max-width: 700px) {
+            .panels-row {
+                flex-direction: column;
+                gap: 8px;
+            }
+            .title-block h2 { font-size: 15px; }
+            .title-block .subtitle { font-size: 10px; }
+            .panel-header h3 { font-size: 12px; }
+            .panel-header .panel-desc { font-size: 9.5px; }
+            .caption { font-size: 9.5px; }
+        }
+    </style>
+</head>
+<body>
+<div class="outer-wrapper">
+    <div class="title-block">
+        <h2>MDP vs FDFO: How Updates Are Computed</h2>
+        <p class="subtitle">The MDP approach reinforces random noise at every step; FDFO extracts a clean signal from paired trajectories</p>
+    </div>
+
+    <div class="panels-row">
+        <!-- Left panel: MDP -->
+        <div class="panel panel-left">
+            <div class="panel-header">
+                <h3>MDP Approach (Flow-GRPO)</h3>
+                <p class="panel-desc">Each denoising step is a separate "action" with injected noise. After reward, all perturbations are reinforced equally.</p>
+            </div>
+            <div class="viz-container">
+                <div id="plot-left" class="plotly-div"></div>
+                <canvas id="canvas-left"></canvas>
+            </div>
+        </div>
+
+        <!-- Right panel: FDFO -->
+        <div class="panel panel-right">
+            <div class="panel-header">
+                <h3>FDFO Approach (Ours)</h3>
+                <p class="panel-desc">Two trajectories from the same noise. The reward difference gives a clean update direction.</p>
+            </div>
+            <div class="viz-container">
+                <div id="plot-right" class="plotly-div"></div>
+                <canvas id="canvas-right"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <div class="bottom-bar">
+        <button class="replay-btn" id="replayBtn" onclick="restartAnimation()">Replay</button>
+        <div class="caption">
+            <strong>Left:</strong> MDP injects noise at each step, then reinforces <em>all</em> perturbations equally &mdash; most signal is noise.
+            <strong>Right:</strong> FDFO compares paired samples and extracts a clean gradient from their reward difference.
+        </div>
+    </div>
+</div>
+
+<script>
+// ===== CONSTANTS =====
+const COLORS = {
+    navy:       '#050532',
+    burgundy:   '#732424',
+    grey:       '#656C75',
+    terracotta: '#AB8064',
+    cream:      '#FAF8F5',
+    teal:       '#1A7A6D',
+    tealLight:  '#8dc4bb',
+    burgundyLight: '#c49090',
+    fadedGrey:  '#b8b5b0',
+};
+
+const xMin = -1.7, xMax = 1.7;
+const nPoints = 200;
+const nTimeSteps = 150;
+
+// Data distribution: bimodal Gaussian mixture
+const dataModes = [
+    { mean: -0.7, std: 0.28, weight: 0.55 },
+    { mean:  0.75, std: 0.28, weight: 0.45 }
+];
+const priorStd = 0.6;
+
+// ODE integration steps for trajectories
+const N_STEPS = 60;
+const dt = 1.0 / N_STEPS;
+
+// Animation timing (seconds)
+const PHASE_FLOW      = 3.0;   // trajectory drawing
+const PHASE_REWARD    = 1.0;   // reward appears
+const PHASE_REINFORCE = 2.5;   // reinforcement highlight
+const PHASE_HOLD      = 2.0;   // hold at end
+const TOTAL_DURATION  = PHASE_FLOW + PHASE_REWARD + PHASE_REINFORCE + PHASE_HOLD;
+
+// ===== MATH =====
+function gaussianPDF(x, mean, std) {
+    const v = std * std;
+    return Math.exp(-0.5 * (x - mean) * (x - mean) / v) / Math.sqrt(2 * Math.PI * v);
+}
+
+function priorPDF(x) { return gaussianPDF(x, 0, priorStd); }
+
+function dataPDF(x) {
+    let p = 0;
+    for (const m of dataModes) p += m.weight * gaussianPDF(x, m.mean, m.std);
+    return p;
+}
+
+function flowPDF(x, t) {
+    let p = 0;
+    for (const m of dataModes) {
+        const mu = t * m.mean;
+        const sig = Math.sqrt(t * t * m.std * m.std + (1 - t) * (1 - t) * priorStd * priorStd);
+        p += m.weight * gaussianPDF(x, mu, sig);
+    }
+    return p;
+}
+
+// E[x1 | xt] via Bayes
+function posteriorMean(x, t) {
+    if (t < 1e-6) return 0;
+    if (t > 1 - 1e-6) return x;
+    const noiseVar = (1 - t) * (1 - t) * priorStd * priorStd;
+    let num = 0, den = 0;
+    for (const m of dataModes) {
+        const pv = m.std * m.std;
+        const postPrec = 1 / pv + t * t / noiseVar;
+        const postVar = 1 / postPrec;
+        const postMu = postVar * (m.mean / pv + t * x / noiseVar);
+        const margMu = t * m.mean;
+        const margVar = t * t * pv + noiseVar;
+        const lik = m.weight * gaussianPDF(x, margMu, Math.sqrt(margVar));
+        num += lik * postMu;
+        den += lik;
+    }
+    return den > 0 ? num / den : x;
+}
+
+function velocity(x, t) {
+    if (t > 1 - 1e-6) return 0;
+    return (posteriorMean(x, t) - x) / (1 - t);
+}
+
+// Box-Muller
+function randn() {
+    return Math.sqrt(-2 * Math.log(Math.random())) * Math.cos(2 * Math.PI * Math.random());
+}
+
+// ===== TRAJECTORY GENERATION =====
+// ODE trajectory (deterministic given x0)
+function odeTrajectory(x0) {
+    const xs = [x0], ts = [0];
+    let x = x0;
+    for (let i = 0; i < N_STEPS; i++) {
+        const t = i * dt;
+        const v = velocity(x, t);
+        x += v * dt;
+        x = Math.max(xMin + 0.05, Math.min(xMax - 0.05, x));
+        xs.push(x);
+        ts.push((i + 1) * dt);
+    }
+    return { xs, ts };
+}
+
+// Trajectory with noise perturbations (for MDP panel)
+function noisyTrajectory(x0, noiseScale) {
+    const xs = [x0], ts = [0], perturbations = [];
+    let x = x0;
+    for (let i = 0; i < N_STEPS; i++) {
+        const t = i * dt;
+        const v = velocity(x, t);
+        const noise = randn() * noiseScale * Math.sqrt(dt) * Math.max(0.1, 1 - t);
+        const xPrev = x;
+        x += v * dt + noise;
+        x = Math.max(xMin + 0.05, Math.min(xMax - 0.05, x));
+        xs.push(x);
+        ts.push((i + 1) * dt);
+        perturbations.push({
+            t: (i + 0.5) * dt,
+            xBase: xPrev + v * dt * 0.5,
+            dx: noise,
+            // Random "direction" angle for showing irrelevance
+            angle: Math.random() * 2 * Math.PI
+        });
+    }
+    return { xs, ts, perturbations };
+}
+
+// Paired FDFO trajectories: same x0, slight stochasticity difference
+function pairedTrajectories(x0) {
+    const pertScale = 0.12;
+    // Shared random seed-ish: generate perturbation schedule
+    const sharedNoise = [];
+    for (let i = 0; i < N_STEPS; i++) sharedNoise.push(randn());
+
+    function runTraj(extraScale) {
+        const xs = [x0], ts = [0];
+        let x = x0;
+        for (let i = 0; i < N_STEPS; i++) {
+            const t = i * dt;
+            const v = velocity(x, t);
+            const noise = sharedNoise[i] * pertScale * Math.sqrt(dt) * Math.max(0.1, 1 - t)
+                        + extraScale * randn() * pertScale * 0.5 * Math.sqrt(dt) * Math.max(0.1, 1 - t);
+            x += v * dt + noise;
+            x = Math.max(xMin + 0.05, Math.min(xMax - 0.05, x));
+            xs.push(x);
+            ts.push((i + 1) * dt);
+        }
+        return { xs, ts };
+    }
+    const trajA = runTraj(1.0);
+    const trajB = runTraj(-1.0);
+    return { trajA, trajB };
+}
+
+// Simple reward function: prefer positive x (right mode)
+function reward(xFinal) {
+    // Higher reward for samples near the right mode
+    return 0.5 + 0.5 * Math.tanh(2.0 * xFinal);
+}
+
+// ===== HEATMAP =====
+function createHeatmapData() {
+    const xGrid = [], tGrid = [];
+    for (let i = 0; i < nPoints; i++) xGrid.push(xMin + (xMax - xMin) * i / (nPoints - 1));
+    for (let j = 0; j < nTimeSteps; j++) tGrid.push(j / (nTimeSteps - 1));
+    const z = [];
+    for (let i = 0; i < nPoints; i++) {
+        const row = [];
+        for (let j = 0; j < nTimeSteps; j++) row.push(flowPDF(xGrid[i], tGrid[j]));
+        z.push(row);
+    }
+    return { xGrid, tGrid, z };
+}
+
+// Cream-toned colorscale: cream -> terracotta -> navy
+const creamColorscale = [
+    [0,    '#FAF8F5'],
+    [0.15, '#f0ebe3'],
+    [0.3,  '#dcc8b4'],
+    [0.5,  '#c4a080'],
+    [0.7,  '#AB8064'],
+    [0.85, '#6b4a3a'],
+    [1.0,  '#050532']
+];
+
+function createPlotlyHeatmap(divId) {
+    const { xGrid, tGrid, z } = createHeatmapData();
+
+    const trace = {
+        x: tGrid,
+        y: xGrid,
+        z: z,
+        type: 'heatmap',
+        colorscale: creamColorscale,
+        showscale: false,
+        hoverinfo: 'none',
+        opacity: 0.55
+    };
+
+    const layout = {
+        hovermode: false,
+        xaxis: {
+            title: { text: 't', font: { size: 11, color: COLORS.grey } },
+            range: [0, 1],
+            zeroline: false,
+            showgrid: false,
+            tickfont: { size: 9, color: COLORS.grey },
+            dtick: 0.5
+        },
+        yaxis: {
+            title: { text: 'x', font: { size: 11, color: COLORS.grey } },
+            range: [xMin, xMax],
+            zeroline: false,
+            showgrid: false,
+            tickfont: { size: 9, color: COLORS.grey },
+            dtick: 1.0
+        },
+        margin: { t: 4, b: 30, l: 28, r: 8 },
+        paper_bgcolor: COLORS.cream,
+        plot_bgcolor: COLORS.cream,
+        showlegend: false,
+    };
+
+    const config = {
+        responsive: true,
+        displayModeBar: false,
+        staticPlot: true,
+        scrollZoom: false
+    };
+
+    return Plotly.newPlot(divId, [trace], layout, config);
+}
+
+// ===== COORDINATE MAPPING =====
+function getMapping(divId) {
+    const el = document.getElementById(divId);
+    if (!el || !el._fullLayout) return null;
+    const xa = el._fullLayout.xaxis;
+    const ya = el._fullLayout.yaxis;
+    return {
+        xMin: xa.range[0], xMax: xa.range[1],
+        yMin: ya.range[0], yMax: ya.range[1],
+        pLeft: xa._offset, pTop: ya._offset,
+        pWidth: xa._length, pHeight: ya._length
+    };
+}
+
+function dataToPixel(m, t, x) {
+    if (!m) return { px: 0, py: 0 };
+    const px = m.pLeft + (t - m.xMin) / (m.xMax - m.xMin) * m.pWidth;
+    const py = m.pTop + m.pHeight - (x - m.yMin) / (m.yMax - m.yMin) * m.pHeight;
+    return { px, py };
+}
+
+// ===== CANVAS SETUP =====
+function setupCanvas(canvasId, plotId) {
+    const canvas = document.getElementById(canvasId);
+    const plotEl = document.getElementById(plotId);
+    const ctx = canvas.getContext('2d');
+    const rect = plotEl.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = rect.width + 'px';
+    canvas.style.height = rect.height + 'px';
+    ctx.scale(dpr, dpr);
+    return { canvas, ctx, w: rect.width, h: rect.height };
+}
+
+// ===== PRECOMPUTE TRAJECTORIES =====
+let mdpTraj = null;
+let fdfoTrajA = null, fdfoTrajB = null;
+let mdpReward = 0;
+let fdfoRewardA = 0, fdfoRewardB = 0;
+
+function generateTrajectories() {
+    // MDP: noisy trajectory
+    const x0_mdp = randn() * priorStd;
+    mdpTraj = noisyTrajectory(x0_mdp, 0.25);
+    mdpReward = reward(mdpTraj.xs[mdpTraj.xs.length - 1]);
+
+    // FDFO: paired trajectories from same x0
+    const x0_fdfo = randn() * priorStd;
+    const pair = pairedTrajectories(x0_fdfo);
+    fdfoTrajA = pair.trajA;
+    fdfoTrajB = pair.trajB;
+    fdfoRewardA = reward(fdfoTrajA.xs[fdfoTrajA.xs.length - 1]);
+    fdfoRewardB = reward(fdfoTrajB.xs[fdfoTrajB.xs.length - 1]);
+
+    // Ensure A has higher reward for consistent labeling
+    if (fdfoRewardA < fdfoRewardB) {
+        const tmp = fdfoTrajA;
+        fdfoTrajA = fdfoTrajB;
+        fdfoTrajB = tmp;
+        const tr = fdfoRewardA;
+        fdfoRewardA = fdfoRewardB;
+        fdfoRewardB = tr;
+    }
+}
+
+// ===== DRAWING HELPERS =====
+function drawTrajectory(ctx, m, traj, progress, color, lineWidth, alpha) {
+    // progress: 0..1, fraction of trajectory to draw
+    const n = traj.xs.length;
+    const endIdx = Math.min(n - 1, Math.floor(progress * (n - 1)));
+    if (endIdx < 1) return;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    const p0 = dataToPixel(m, traj.ts[0], traj.xs[0]);
+    ctx.moveTo(p0.px, p0.py);
+    for (let i = 1; i <= endIdx; i++) {
+        const p = dataToPixel(m, traj.ts[i], traj.xs[i]);
+        ctx.lineTo(p.px, p.py);
+    }
+    // Partial segment for smooth animation
+    const frac = progress * (n - 1) - endIdx;
+    if (endIdx < n - 1 && frac > 0) {
+        const pA = dataToPixel(m, traj.ts[endIdx], traj.xs[endIdx]);
+        const pB = dataToPixel(m, traj.ts[endIdx + 1], traj.xs[endIdx + 1]);
+        ctx.lineTo(pA.px + (pB.px - pA.px) * frac, pA.py + (pB.py - pA.py) * frac);
+    }
+    ctx.stroke();
+    ctx.restore();
+}
+
+function drawParticle(ctx, m, t, x, radius, color, alpha) {
+    const p = dataToPixel(m, t, x);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    // Glow
+    ctx.fillStyle = color;
+    ctx.globalAlpha = alpha * 0.25;
+    ctx.beginPath();
+    ctx.arc(p.px, p.py, radius * 2.2, 0, 2 * Math.PI);
+    ctx.fill();
+    // Core
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(p.px, p.py, radius, 0, 2 * Math.PI);
+    ctx.fill();
+    // White center
+    ctx.fillStyle = '#fff';
+    ctx.globalAlpha = alpha * 0.6;
+    ctx.beginPath();
+    ctx.arc(p.px, p.py, radius * 0.35, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.restore();
+}
+
+function drawLabel(ctx, m, t, x, text, color, fontSize, offsetX, offsetY, alpha) {
+    const p = dataToPixel(m, t, x);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = `bold ${fontSize}px Arial`;
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, p.px + offsetX, p.py + offsetY);
+    ctx.restore();
+}
+
+function drawLabelPixel(ctx, px, py, text, color, fontSize, alpha, align) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = `bold ${fontSize}px Arial`;
+    ctx.fillStyle = color;
+    ctx.textAlign = align || 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, px, py);
+    ctx.restore();
+}
+
+// Draw perturbation markers for MDP
+function drawPerturbations(ctx, m, perturbations, progress, highlightAlpha) {
+    const n = perturbations.length;
+    const endIdx = Math.min(n, Math.floor(progress * n));
+
+    for (let i = 0; i < endIdx; i++) {
+        const pert = perturbations[i];
+        const p = dataToPixel(m, pert.t, pert.xBase);
+
+        // Draw a small kick arrow
+        const kickLen = Math.abs(pert.dx) * 80;
+        const clampedLen = Math.max(2, Math.min(12, kickLen));
+
+        ctx.save();
+        ctx.globalAlpha = 0.6;
+        ctx.strokeStyle = COLORS.burgundy;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(p.px, p.py);
+        ctx.lineTo(p.px, p.py + (pert.dx > 0 ? -clampedLen : clampedLen));
+        ctx.stroke();
+
+        // Small dot at base
+        ctx.fillStyle = COLORS.burgundy;
+        ctx.globalAlpha = 0.5;
+        ctx.beginPath();
+        ctx.arc(p.px, p.py, 2, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.restore();
+    }
+
+    // Highlight phase: all perturbations glow uniformly
+    if (highlightAlpha > 0) {
+        for (let i = 0; i < n; i++) {
+            const pert = perturbations[i];
+            const p = dataToPixel(m, pert.t, pert.xBase);
+
+            ctx.save();
+            // Uniform yellow-orange highlight to show "all reinforced equally"
+            ctx.globalAlpha = highlightAlpha * 0.5;
+            ctx.fillStyle = COLORS.burgundy;
+            ctx.beginPath();
+            ctx.arc(p.px, p.py, 6, 0, 2 * Math.PI);
+            ctx.fill();
+
+            // Draw random-direction arrows to show irrelevance
+            ctx.globalAlpha = highlightAlpha * 0.65;
+            ctx.strokeStyle = COLORS.burgundy;
+            ctx.lineWidth = 1.5;
+            const arrowLen = 10;
+            const ax = Math.cos(pert.angle) * arrowLen;
+            const ay = Math.sin(pert.angle) * arrowLen;
+            ctx.beginPath();
+            ctx.moveTo(p.px, p.py);
+            ctx.lineTo(p.px + ax, p.py + ay);
+            ctx.stroke();
+            // Arrowhead
+            const headLen = 3.5;
+            const headAngle = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(p.px + ax, p.py + ay);
+            ctx.lineTo(
+                p.px + ax - headLen * Math.cos(pert.angle - headAngle),
+                p.py + ay - headLen * Math.sin(pert.angle - headAngle)
+            );
+            ctx.moveTo(p.px + ax, p.py + ay);
+            ctx.lineTo(
+                p.px + ax - headLen * Math.cos(pert.angle + headAngle),
+                p.py + ay - headLen * Math.sin(pert.angle + headAngle)
+            );
+            ctx.stroke();
+            ctx.restore();
+        }
+    }
+}
+
+// Draw the FDFO update arrow at a given position
+function drawUpdateArrow(ctx, px, py, dx, dy, len, color, alpha, lineWidth) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = lineWidth || 2;
+    ctx.lineCap = 'round';
+
+    // Normalize direction
+    const mag = Math.sqrt(dx * dx + dy * dy) || 1;
+    const nx = dx / mag, ny = dy / mag;
+    const ex = px + nx * len, ey = py + ny * len;
+
+    ctx.beginPath();
+    ctx.moveTo(px, py);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+
+    // Arrowhead
+    const headLen = Math.min(8, len * 0.35);
+    const headAngle = 0.45;
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(
+        ex - headLen * Math.cos(Math.atan2(ny, nx) - headAngle),
+        ey - headLen * Math.sin(Math.atan2(ny, nx) - headAngle)
+    );
+    ctx.lineTo(
+        ex - headLen * Math.cos(Math.atan2(ny, nx) + headAngle),
+        ey - headLen * Math.sin(Math.atan2(ny, nx) + headAngle)
+    );
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+}
+
+// Draw a rounded-rect label box
+function drawBoxLabel(ctx, px, py, text, bgColor, textColor, fontSize, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = `bold ${fontSize}px Arial`;
+    const tw = ctx.measureText(text).width;
+    const padX = 6, padY = 3;
+    const bx = px - tw / 2 - padX;
+    const by = py - fontSize / 2 - padY;
+    const bw = tw + 2 * padX;
+    const bh = fontSize + 2 * padY;
+    const r = 4;
+
+    ctx.fillStyle = bgColor;
+    ctx.beginPath();
+    ctx.moveTo(bx + r, by);
+    ctx.lineTo(bx + bw - r, by);
+    ctx.quadraticCurveTo(bx + bw, by, bx + bw, by + r);
+    ctx.lineTo(bx + bw, by + bh - r);
+    ctx.quadraticCurveTo(bx + bw, by + bh, bx + bw - r, by + bh);
+    ctx.lineTo(bx + r, by + bh);
+    ctx.quadraticCurveTo(bx, by + bh, bx, by + bh - r);
+    ctx.lineTo(bx, by + r);
+    ctx.quadraticCurveTo(bx, by, bx + r, by);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = textColor;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, px, py);
+    ctx.restore();
+}
+
+// ===== ANIMATION =====
+let animStartTime = null;
+let animRunning = false;
+let leftCtx, rightCtx, leftMapping, rightMapping;
+let leftW, leftH, rightW, rightH;
+
+function easeInOut(t) {
+    return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+}
+
+function easeOut(t) {
+    return 1 - (1 - t) * (1 - t);
+}
+
+function renderFrame(elapsed) {
+    // Phase timings
+    const tFlow = Math.min(1, elapsed / PHASE_FLOW);
+    const tReward = Math.max(0, Math.min(1, (elapsed - PHASE_FLOW) / PHASE_REWARD));
+    const tReinforce = Math.max(0, Math.min(1, (elapsed - PHASE_FLOW - PHASE_REWARD) / PHASE_REINFORCE));
+
+    const flowProgress = easeInOut(tFlow);
+    const rewardAlpha = easeOut(tReward);
+    const reinforceAlpha = easeOut(tReinforce);
+
+    // ===== LEFT PANEL: MDP =====
+    leftCtx.clearRect(0, 0, leftW, leftH);
+
+    if (mdpTraj && leftMapping) {
+        const m = leftMapping;
+
+        // Draw trajectory
+        drawTrajectory(leftCtx, m, mdpTraj, flowProgress, COLORS.navy, 2.5, 0.85);
+
+        // Draw perturbation kicks
+        drawPerturbations(leftCtx, m, mdpTraj.perturbations, flowProgress, reinforceAlpha);
+
+        // Current position particle
+        const curIdx = Math.min(mdpTraj.xs.length - 1, Math.floor(flowProgress * (mdpTraj.xs.length - 1)));
+        const curT = mdpTraj.ts[curIdx];
+        const curX = mdpTraj.xs[curIdx];
+        drawParticle(leftCtx, m, curT, curX, 5, COLORS.navy, 0.9);
+
+        // Starting point
+        drawParticle(leftCtx, m, 0, mdpTraj.xs[0], 4, COLORS.grey, 0.6);
+
+        // Reward score at t=1
+        if (rewardAlpha > 0) {
+            const finalX = mdpTraj.xs[mdpTraj.xs.length - 1];
+            const pFinal = dataToPixel(m, 1.0, finalX);
+            drawBoxLabel(leftCtx, pFinal.px - 4, pFinal.py - 20,
+                `R = ${mdpReward.toFixed(2)}`, COLORS.navy, '#fff', 10, rewardAlpha);
+        }
+
+        // "All steps reinforced equally" label
+        if (reinforceAlpha > 0) {
+            const labelP = dataToPixel(m, 0.5, xMin + 0.35);
+            drawBoxLabel(leftCtx, labelP.px, labelP.py,
+                'All steps reinforced equally', COLORS.burgundy, '#fff', 9, reinforceAlpha * 0.9);
+        }
+    }
+
+    // ===== RIGHT PANEL: FDFO =====
+    rightCtx.clearRect(0, 0, rightW, rightH);
+
+    if (fdfoTrajA && fdfoTrajB && rightMapping) {
+        const m = rightMapping;
+
+        // Draw both trajectories
+        // Trajectory B (lower reward): faded
+        drawTrajectory(rightCtx, m, fdfoTrajB, flowProgress, COLORS.fadedGrey, 2, 0.5);
+        // Trajectory A (higher reward): teal
+        drawTrajectory(rightCtx, m, fdfoTrajA, flowProgress, COLORS.teal, 2.5, 0.85);
+
+        // Current position particles
+        const curIdxA = Math.min(fdfoTrajA.xs.length - 1, Math.floor(flowProgress * (fdfoTrajA.xs.length - 1)));
+        const curIdxB = Math.min(fdfoTrajB.xs.length - 1, Math.floor(flowProgress * (fdfoTrajB.xs.length - 1)));
+
+        drawParticle(rightCtx, m, fdfoTrajB.ts[curIdxB], fdfoTrajB.xs[curIdxB], 4, COLORS.fadedGrey, 0.6);
+        drawParticle(rightCtx, m, fdfoTrajA.ts[curIdxA], fdfoTrajA.xs[curIdxA], 5, COLORS.teal, 0.9);
+
+        // Starting point (shared)
+        drawParticle(rightCtx, m, 0, fdfoTrajA.xs[0], 4, COLORS.grey, 0.6);
+
+        // "Same x_0" label near start
+        if (flowProgress > 0.05) {
+            const startP = dataToPixel(m, 0, fdfoTrajA.xs[0]);
+            drawLabelPixel(rightCtx, startP.px + 12, startP.py - 12,
+                'Same x\u2080', COLORS.grey, 9, 0.7 * Math.min(1, flowProgress * 5), 'left');
+        }
+
+        // Reward scores at t=1
+        if (rewardAlpha > 0) {
+            const finalXA = fdfoTrajA.xs[fdfoTrajA.xs.length - 1];
+            const finalXB = fdfoTrajB.xs[fdfoTrajB.xs.length - 1];
+            const pA = dataToPixel(m, 1.0, finalXA);
+            const pB = dataToPixel(m, 1.0, finalXB);
+
+            drawBoxLabel(rightCtx, pA.px - 4, pA.py - 20,
+                `R = ${fdfoRewardA.toFixed(2)}`, COLORS.teal, '#fff', 10, rewardAlpha);
+            drawBoxLabel(rightCtx, pB.px - 4, pB.py + 20,
+                `R = ${fdfoRewardB.toFixed(2)}`, COLORS.fadedGrey, '#fff', 10, rewardAlpha * 0.7);
+        }
+
+        // Reinforcement phase: show clean update arrows along trajectory
+        if (reinforceAlpha > 0) {
+            const finalXA = fdfoTrajA.xs[fdfoTrajA.xs.length - 1];
+            const finalXB = fdfoTrajB.xs[fdfoTrajB.xs.length - 1];
+            const diffX = finalXA - finalXB; // image-space difference
+
+            // Show update arrows at sampled points along the trajectory
+            const nArrows = 10;
+            const arrowAppearStagger = 0.15; // stagger arrows appearing
+            for (let a = 0; a < nArrows; a++) {
+                const frac = (a + 0.5) / nArrows;
+                const arrowAlpha = reinforceAlpha * Math.max(0, Math.min(1,
+                    (reinforceAlpha - frac * arrowAppearStagger) / (1 - arrowAppearStagger)));
+                if (arrowAlpha <= 0) continue;
+
+                const idxA = Math.floor(frac * (fdfoTrajA.xs.length - 1));
+                const tMid = fdfoTrajA.ts[idxA];
+                const xMid = (fdfoTrajA.xs[idxA] + fdfoTrajB.xs[idxA]) / 2;
+                const p = dataToPixel(m, tMid, xMid);
+
+                // Arrow direction: from B to A in pixel space
+                const pA = dataToPixel(m, tMid, fdfoTrajA.xs[idxA]);
+                const pB = dataToPixel(m, tMid, fdfoTrajB.xs[idxA]);
+                const dx = pA.px - pB.px;
+                const dy = pA.py - pB.py;
+
+                drawUpdateArrow(rightCtx, pB.px, pB.py, dx, dy,
+                    Math.sqrt(dx * dx + dy * dy), COLORS.teal, arrowAlpha * 0.7, 2);
+            }
+
+            // Final difference arrow (bigger, prominent)
+            const pFA = dataToPixel(m, 1.0, finalXA);
+            const pFB = dataToPixel(m, 1.0, finalXB);
+            const fdx = pFA.px - pFB.px;
+            const fdy = pFA.py - pFB.py;
+            drawUpdateArrow(rightCtx, pFB.px, pFB.py, fdx, fdy,
+                Math.sqrt(fdx * fdx + fdy * fdy), COLORS.teal, reinforceAlpha * 0.9, 3);
+
+            // Label
+            const labelP = dataToPixel(m, 0.5, xMin + 0.35);
+            drawBoxLabel(rightCtx, labelP.px, labelP.py,
+                'Reward diff \u2192 clean update', COLORS.teal, '#fff', 9, reinforceAlpha * 0.9);
+        }
+    }
+}
+
+function animationLoop(timestamp) {
+    if (!animStartTime) animStartTime = timestamp;
+    const elapsed = (timestamp - animStartTime) / 1000;
+
+    if (elapsed > TOTAL_DURATION) {
+        // Render final frame then restart after pause
+        renderFrame(TOTAL_DURATION - 0.01);
+        animStartTime = null;
+        // Auto-loop: regenerate and restart
+        setTimeout(() => {
+            if (animRunning) {
+                generateTrajectories();
+                animStartTime = null;
+                requestAnimationFrame(animationLoop);
+            }
+        }, 500);
+        return;
+    }
+
+    renderFrame(elapsed);
+    if (animRunning) requestAnimationFrame(animationLoop);
+}
+
+function startAnimation() {
+    animRunning = true;
+    animStartTime = null;
+    requestAnimationFrame(animationLoop);
+}
+
+function stopAnimation() {
+    animRunning = false;
+}
+
+function restartAnimation() {
+    stopAnimation();
+    generateTrajectories();
+    // Re-setup canvases in case of resize
+    initCanvases();
+    startAnimation();
+}
+
+// ===== INIT =====
+function initCanvases() {
+    const sl = setupCanvas('canvas-left', 'plot-left');
+    leftCtx = sl.ctx; leftW = sl.w; leftH = sl.h;
+    leftMapping = getMapping('plot-left');
+
+    const sr = setupCanvas('canvas-right', 'plot-right');
+    rightCtx = sr.ctx; rightW = sr.w; rightH = sr.h;
+    rightMapping = getMapping('plot-right');
+}
+
+async function init() {
+    await Promise.all([
+        createPlotlyHeatmap('plot-left'),
+        createPlotlyHeatmap('plot-right')
+    ]);
+
+    // Small delay for Plotly layout to settle
+    await new Promise(r => setTimeout(r, 150));
+
+    initCanvases();
+    generateTrajectories();
+    startAnimation();
+}
+
+// Handle resize
+let resizeTimer;
+window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(async () => {
+        // Plotly auto-resizes; we just need to re-sync canvases
+        await new Promise(r => setTimeout(r, 100));
+        initCanvases();
+    }, 200);
+});
+
+init();
+</script>
+</body>
+</html>
