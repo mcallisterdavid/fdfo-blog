@@ -1,0 +1,1179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Soft Jacobian Flow — Fractal Heatmap</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:Arial,sans-serif;background:#fff}
+.wrap{height:100%;display:flex;flex-direction:column;align-items:center;padding:0 12px 6px}
+.cbox{flex:0 0 auto;width:100%;aspect-ratio:1.4/1;max-height:calc(100vh - 100px);border-radius:16px;overflow:hidden;background:#0C3383;cursor:crosshair;position:relative}
+#bg,#fg{border-radius:16px}
+#bg{position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:auto}
+#fg{position:absolute;top:0;left:0;width:100%;height:100%}
+.srow{display:flex;align-items:center;justify-content:center;gap:12px;margin:12px auto 0;max-width:480px}
+.srow label{font:bold 13px Arial;color:#1B1B3A;white-space:nowrap}
+.srow .v{color:#1B1B3A;min-width:36px;text-align:right}
+input[type=range]{flex:1;height:5px;border-radius:5px;background:#ddd;outline:none;-webkit-appearance:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#E05D36;cursor:pointer}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:#E05D36;cursor:pointer;border:none}
+.cap{text-align:center;margin-top:10px;color:#555;font-size:13px;line-height:1.5}
+.cap a{color:#E05D36;cursor:pointer;text-decoration:underline}
+.loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font:bold 16px Arial;color:#FAF8F5}
+@media(max-width:600px){.wrap{padding:0 8px 4px}.cap{font-size:11px}input[type=range]::-webkit-slider-thumb{width:26px;height:26px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="cbox" id="box">
+    <canvas id="bg"></canvas>
+    <canvas id="fg"></canvas>
+    <div class="loading" id="loadMsg">Computing density...</div>
+  </div>
+  <div class="srow">
+    <label>t = <span class="v" id="stepVal">0.00</span></label>
+    <input type="range" id="stepSlider" min="0" max="200" value="0" step="1">
+  </div>
+  <div class="cap">
+    The heatmap shows the model's <b>soft approximation</b>; the crisp branches show the <b>true data manifold</b>.
+    ODE paths sample from the soft distribution. <b>Click</b> to reposition noise sample, <b>drag dial</b> to rotate gradient.
+    <a id="resumeLink" style="display:none" onclick="resumeAuto()">Resume animation</a>
+  </div>
+</div>
+
+<script>
+// ================================================================
+// Plotly Portland colorscale (matches FPO flow_sde_plot.html)
+// ================================================================
+const PORTLAND_STOPS = [
+  {t:0.0,  r:12,  g:51,  b:131},  // #0C3383 dark blue
+  {t:0.25, r:10,  g:136, b:186},  // #0A88BA teal
+  {t:0.5,  r:242, g:211, b:56},   // #F2D338 yellow
+  {t:0.75, r:242, g:143, b:56},   // #F28F38 orange
+  {t:1.0,  r:217, g:30,  b:30},   // #D91E1E red
+];
+
+function portlandColor(t) {
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 0; i < PORTLAND_STOPS.length - 1; i++) {
+    const s0 = PORTLAND_STOPS[i], s1 = PORTLAND_STOPS[i + 1];
+    if (t >= s0.t && t <= s1.t) {
+      const f = (t - s0.t) / (s1.t - s0.t);
+      return [
+        Math.round(s0.r + (s1.r - s0.r) * f),
+        Math.round(s0.g + (s1.g - s0.g) * f),
+        Math.round(s0.b + (s1.b - s0.b) * f)
+      ];
+    }
+  }
+  const last = PORTLAND_STOPS[PORTLAND_STOPS.length - 1];
+  return [last.r, last.g, last.b];
+}
+
+// ================================================================
+// Style constants
+// ================================================================
+const STYLE = {
+  bg: '#0C3383',
+  bgRGB: [12, 51, 131],
+
+  // Tree branches: all red to match heatmap high-density color
+  treeTrunkRGB: [217, 30, 30],    // red (Portland hot end)
+  treeTipRGB:   [217, 30, 30],    // red (same — no gradient)
+
+  // Sampling path
+  pathRGB:   [255, 255, 255],     // white path for max contrast
+  pathHex:   '#FFFFFF',
+
+  // Gradient arrows
+  burgundy:  '#FFFFFF',           // hero/reward arrow in white
+  navyRGB:   [12, 51, 131],
+  navyHex:   '#0C3383',
+
+  // Angle deviation colors (teal -> yellow -> red, matching Portland)
+  angleMidRGB: [242, 211, 56],
+  angleBadRGB: [217, 30, 30],
+
+  greyRGB: [160, 160, 180],
+
+  // Tree passes — thick, full opacity, blending into heatmap
+  glowBase: 32, glowDecay: 0.62, glowFloor: 6,
+  glowAlpha: 0.35, glowAlphaDecay: 0.75, glowAlphaFloor: 0.10,
+
+  midBase: 18, midDecay: 0.62, midFloor: 4,
+  midAlpha: 0.65, midAlphaDecay: 0.78, midAlphaFloor: 0.25,
+
+  taperWidth: 18.0, taperDecay: 0.68,
+  taperFloorBase: 2.0, taperFloorTip: 1.2,
+  taperAlpha: 1.0, taperAlphaStep: 0.0, taperAlphaFloor: 1.0,
+
+  hlWidth: 0, hlDecay: 0.55, hlFloor: 0,
+  hlAlpha: 0, hlAlphaDecay: 0.6, hlMaxDepth: -1,
+
+  // Sampling path
+  pathShadowW: 4, pathShadowAlpha: 0.3,
+  pathDimAlpha: 0.6, pathDimW: 4,
+  pathActiveAlpha: 1.0, pathActiveW: 4.5,
+  chevronSize: 2, chevronHalf: 0.3,
+  chevronActiveAlpha: 0.55, chevronInactiveAlpha: 0.15,
+  dotOuterR: 5, dotInnerR: 3.5,
+  cursorOuterR: 7, cursorInnerR: 5, cursorRingW: 2,
+  x0HandleR: 14,
+
+  // Gradient arrows
+  arrowFrac: 0.045,
+  heroScale: 1.5,
+  trailW: 1.8, trailHead: 7,
+  trailAlpha: 0.2, trailAlphaFade: 0, trailAlphaFloor: 0.8,
+  heroW: 3.5, heroHead: 12, heroShadowW: 6, heroShadowHead: 14,
+
+  // Legend
+  legendR: 36, legendMargin: 20, legendArrow: 24,
+  legendHeadSize: 10, legendHeadHalf: 0.45,
+  legendShaftW: 2.5, legendHitPad: 12,
+
+  // View
+  canvasAR: 1.4,
+  padLoFrac: 0.06,
+  padHiFrac: 0.42,
+  initX0: [0.72, 0.68],
+
+  // Animation timing
+  forwardDuration: 3.0,
+  backwardDuration: 4.5,
+  holdDuration: 1.0,
+  fadeDuration: 0.8,
+  pauseDuration: 0.5,
+  waveFrontWidth: 3.0,
+
+  hintDash: [4, 8],
+  hintAlpha: 0.25,
+  hintWidth: 1.5,
+
+  // Soft distribution: inflation factor for component stds
+  softInflation: 4.0,
+  // Heatmap resolution
+  heatmapRes: 600,
+};
+
+function rgba(rgb, a) { return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`; }
+
+// ================================================================
+// Seeded PRNG
+// ================================================================
+function mb32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function mkGauss(rng){return function(){const u=rng(),v=rng();return Math.sqrt(-2*Math.log(u+1e-12))*Math.cos(6.2832*v)}}
+
+// ================================================================
+// Build fractal tree distribution
+// ================================================================
+const COMPS = [];
+const BRANCHES = [];
+
+function buildTree() {
+  const rng = mb32(2);
+  const gauss = mkGauss(rng);
+  const origin = [0.0030, 0.0325];
+  const scale = [1.3136, 1.3844];
+
+  function recurse(cls, depth, pos, angle) {
+    if (depth >= 7) return;
+    const cdx = Math.cos(angle), cdy = Math.sin(angle);
+    const distR = gauss() * 0.2 + 1;
+    const dist = 0.292 * Math.pow(0.8, depth) * distR;
+    const thick = Math.min(0.2 * Math.pow(0.8, depth) / dist, 0.999);
+    const sz0 = scale[0] * dist * 0.06, sz1 = scale[1] * dist * 0.06;
+    const phi = dist * Math.pow(0.5, depth);
+
+    BRANCHES.push({
+      x0: pos[0] * scale[0], y0: pos[1] * scale[1],
+      x1: (pos[0] + cdx * dist) * scale[0], y1: (pos[1] + cdy * dist) * scale[1],
+      depth: depth, cls: cls
+    });
+
+    for (let i = 0; i < 8; i++) {
+      const t = 0.07 + (0.93 - 0.07) * i / 7;
+      const mx = (pos[0] + cdx * dist * t) * scale[0];
+      const my = (pos[1] + cdy * dist * t) * scale[1];
+      const a00 = sz0 * sz0, a11 = sz1 * sz1;
+      const b00 = thick * thick * a00, b11 = thick * thick * a11;
+      const S00 = cdx * cdx * (a00 - b00) + b00;
+      const S01 = cdx * cdy * Math.sqrt(Math.abs((a00 - b00) * (a11 - b11))) * Math.sign(a00 - b00);
+      const S11 = cdy * cdy * (a11 - b11) + b11;
+      const det = S00 * S11 - S01 * S01;
+      if (det < 1e-30) continue;
+      const idet = 1 / det;
+      COMPS.push({
+        mu: [mx, my],
+        S: [[S00, S01], [S01, S11]],
+        Sinv: [[S11 * idet, -S01 * idet], [-S01 * idet, S00 * idet]],
+        det: det,
+        phi: phi,
+        cls: cls,
+        depth: depth
+      });
+    }
+    for (const sign of [1, -1]) {
+      const angleNew = angle + sign * Math.pow(0.7, depth) * (gauss() * 0.2 + 1);
+      recurse(cls, depth + 1, [pos[0] + cdx * dist, pos[1] + cdy * dist], angleNew);
+    }
+  }
+
+  recurse('A', 0, [origin[0], origin[1]], Math.PI * 0.25);
+  recurse('B', 0, [origin[0], origin[1]], Math.PI * 1.25);
+}
+buildTree();
+
+// ================================================================
+// Compute inflated covariances for the soft distribution
+// ================================================================
+const SOFT_COMPS = COMPS.map(c => {
+  const inf2 = STYLE.softInflation * STYLE.softInflation;
+  const sS00 = c.S[0][0] * inf2;
+  const sS01 = c.S[0][1] * inf2;
+  const sS11 = c.S[1][1] * inf2;
+  const sDet = sS00 * sS11 - sS01 * sS01;
+  const sIdet = sDet > 1e-30 ? 1 / sDet : 0;
+  return {
+    mu: c.mu,
+    S: [[sS00, sS01], [sS01, sS11]],
+    Sinv: [[sS11 * sIdet, -sS01 * sIdet], [-sS01 * sIdet, sS00 * sIdet]],
+    det: sDet,
+    phi: c.phi,
+    cls: c.cls,
+    depth: c.depth
+  };
+});
+
+// ================================================================
+// View bounds
+// ================================================================
+const ORIGIN_SX = 0.0030 * 1.3136, ORIGIN_SY = 0.0325 * 1.3844;
+let VX0 = ORIGIN_SX, VX1 = -Infinity, VY0 = ORIGIN_SY, VY1 = -Infinity;
+for (const c of COMPS) {
+  if (c.cls !== 'A') continue;
+  const r = 3 * Math.sqrt(Math.max(c.S[0][0], c.S[1][1]));
+  VX1 = Math.max(VX1, c.mu[0] + r);
+  VY1 = Math.max(VY1, c.mu[1] + r);
+}
+const padLo = STYLE.padLoFrac * Math.max(VX1 - VX0, VY1 - VY0);
+VX0 -= padLo; VY0 -= padLo;
+const padHi = STYLE.padHiFrac * Math.max(VX1 - VX0, VY1 - VY0);
+VX1 += padHi; VY1 += padHi;
+const span = Math.max(VX1 - VX0, VY1 - VY0);
+VX1 = VX0 + span; VY1 = VY0 + span;
+if (STYLE.canvasAR > 1) {
+  VX1 = VX0 + span * STYLE.canvasAR;
+}
+
+// ================================================================
+// Spatial index for fast component lookup
+// ================================================================
+const GRID_CELLS = 32;
+const spatialGrid = new Array(GRID_CELLS * GRID_CELLS);
+for (let i = 0; i < spatialGrid.length; i++) spatialGrid[i] = [];
+
+// Spatial grid for soft comps (larger radius)
+const spatialGridSoft = new Array(GRID_CELLS * GRID_CELLS);
+for (let i = 0; i < spatialGridSoft.length; i++) spatialGridSoft[i] = [];
+
+function cellIdx(x, y) {
+  const ci = Math.floor((x - VX0) / (VX1 - VX0) * GRID_CELLS);
+  const cj = Math.floor((y - VY0) / (VY1 - VY0) * GRID_CELLS);
+  return [Math.max(0, Math.min(GRID_CELLS - 1, ci)), Math.max(0, Math.min(GRID_CELLS - 1, cj))];
+}
+
+for (let k = 0; k < COMPS.length; k++) {
+  const c = COMPS[k];
+  const r = 4 * Math.sqrt(Math.max(c.S[0][0], c.S[1][1]));
+  const [ci0, cj0] = cellIdx(c.mu[0] - r, c.mu[1] - r);
+  const [ci1, cj1] = cellIdx(c.mu[0] + r, c.mu[1] + r);
+  for (let ci = ci0; ci <= ci1; ci++) for (let cj = cj0; cj <= cj1; cj++) {
+    spatialGrid[cj * GRID_CELLS + ci].push(k);
+  }
+}
+
+for (let k = 0; k < SOFT_COMPS.length; k++) {
+  const c = SOFT_COMPS[k];
+  const r = 4 * Math.sqrt(Math.max(c.S[0][0], c.S[1][1]));
+  const [ci0, cj0] = cellIdx(c.mu[0] - r, c.mu[1] - r);
+  const [ci1, cj1] = cellIdx(c.mu[0] + r, c.mu[1] + r);
+  for (let ci = ci0; ci <= ci1; ci++) for (let cj = cj0; cj <= cj1; cj++) {
+    spatialGridSoft[cj * GRID_CELLS + ci].push(k);
+  }
+}
+
+const SIGMA_MAX = 0.7;
+const SIGMA2 = SIGMA_MAX * SIGMA_MAX;
+
+function nearbyComps(x, y, extraR) {
+  const r = extraR + SIGMA_MAX;
+  const [ci0, cj0] = cellIdx(x - r, y - r);
+  const [ci1, cj1] = cellIdx(x + r, y + r);
+  const seen = new Set();
+  const result = [];
+  for (let ci = ci0; ci <= ci1; ci++) for (let cj = cj0; cj <= cj1; cj++) {
+    for (const k of spatialGrid[cj * GRID_CELLS + ci]) {
+      if (!seen.has(k)) { seen.add(k); result.push(k); }
+    }
+  }
+  return result;
+}
+
+function nearbySoftComps(x, y, extraR) {
+  const r = extraR + SIGMA_MAX * STYLE.softInflation;
+  const [ci0, cj0] = cellIdx(x - r, y - r);
+  const [ci1, cj1] = cellIdx(x + r, y + r);
+  const seen = new Set();
+  const result = [];
+  for (let ci = ci0; ci <= ci1; ci++) for (let cj = cj0; cj <= cj1; cj++) {
+    for (const k of spatialGridSoft[cj * GRID_CELLS + ci]) {
+      if (!seen.has(k)) { seen.add(k); result.push(k); }
+    }
+  }
+  return result;
+}
+
+// ================================================================
+// Pre-compute the 2D soft density heatmap
+// ================================================================
+let heatmapCanvas = null; // offscreen canvas, created after computing density
+
+// Point-to-segment distance (returns distance from point to nearest point on segment)
+function ptSegDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-12) return Math.sqrt((px - ax) * (px - ax) + (py - ay) * (py - ay));
+  let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx, cy = ay + t * dy;
+  return Math.sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
+}
+
+function computeHeatmap() {
+  const res = STYLE.heatmapRes;
+
+  // ── TUNING KNOBS ──
+  // sigma_scale: how wide each branch's glow is relative to its visual width
+  const sigma_scale = 1.1;
+  // gamma: power curve on the final value (< 1 = more red, > 1 = less red)
+  const gamma = 1.8;
+
+  // Build branch info with width-proportional sigma
+  const approxScale = res / (VX1 - VX0);
+  const branchInfo = [];
+  for (const br of BRANCHES) {
+    if (br.cls !== 'A') continue;
+    const wPx = Math.max(STYLE.taperFloorBase, STYLE.taperWidth * Math.pow(STYLE.taperDecay, br.depth));
+    const wData = wPx / approxScale;
+    const sigma = wData * sigma_scale;
+    const cutoff = sigma * 10.0;  // Lorentzian has heavy tails, need wide cutoff
+    branchInfo.push({
+      x0: br.x0, y0: br.y0, x1: br.x1, y1: br.y1, sigma: sigma, cutoff: cutoff
+    });
+  }
+
+  const dxStep = (VX1 - VX0) / res;
+  const dyStep = (VY1 - VY0) / res;
+  const proximity = new Float64Array(res * res);
+
+  // Distance field with Lorentzian falloff — max across branches (no junction inflation)
+  for (let j = 0; j < res; j++) {
+    const py = VY0 + (j + 0.5) * dyStep;
+    for (let i = 0; i < res; i++) {
+      const px = VX0 + (i + 0.5) * dxStep;
+      let maxVal = 0;
+      for (const br of branchInfo) {
+        const dist = ptSegDist(px, py, br.x0, br.y0, br.x1, br.y1);
+        if (dist > br.cutoff) continue;
+        // Lorentzian: 1 / (1 + (d/sigma)^2) — heavy tails, gradual soft fade
+        const normD = dist / br.sigma;
+        const val = 1.0 / (1.0 + normD * normD);
+        if (val > maxVal) maxVal = val;
+      }
+      proximity[j * res + i] = maxVal;
+    }
+  }
+
+  // Render to offscreen canvas
+  heatmapCanvas = document.createElement('canvas');
+  heatmapCanvas.width = res;
+  heatmapCanvas.height = res;
+  const ctx = heatmapCanvas.getContext('2d');
+  const imgData = ctx.createImageData(res, res);
+
+  for (let j = 0; j < res; j++) {
+    for (let i = 0; i < res; i++) {
+      const raw = proximity[j * res + i];
+      const t = Math.max(0, Math.min(1, gamma === 1.0 ? raw : Math.pow(raw, gamma)));
+      const [r, g, b] = portlandColor(t);
+
+      const row = res - 1 - j;
+      const idx = (row * res + i) * 4;
+      imgData.data[idx] = r;
+      imgData.data[idx + 1] = g;
+      imgData.data[idx + 2] = b;
+      imgData.data[idx + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+}
+
+// ================================================================
+// Vector rendering: heatmap + fractal tree on background canvas
+// ================================================================
+const MAX_DEPTH = 6;
+
+function branchRGB(depth) {
+  const t = depth / MAX_DEPTH;
+  const n = STYLE.treeTrunkRGB, p = STYLE.treeTipRGB;
+  return [
+    Math.round(n[0] + (p[0] - n[0]) * t),
+    Math.round(n[1] + (p[1] - n[1]) * t),
+    Math.round(n[2] + (p[2] - n[2]) * t)
+  ];
+}
+
+function renderBackground() {
+  const bgC = document.getElementById('bg');
+  const bgDpr = window.devicePixelRatio || 1;
+  const box = document.getElementById('box');
+  const rect = box.getBoundingClientRect();
+  const bW = rect.width, bH = rect.height;
+  bgC.width = bW * bgDpr; bgC.height = bH * bgDpr;
+  bgC.style.width = bW + 'px'; bgC.style.height = bH + 'px';
+  const ctx = bgC.getContext('2d');
+  ctx.scale(bgDpr, bgDpr);
+
+  // Layer 1: Draw the heatmap as background, stretched to fill canvas
+  if (heatmapCanvas) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(heatmapCanvas, 0, 0, bW, bH);
+  } else {
+    ctx.fillStyle = STYLE.bg;
+    ctx.fillRect(0, 0, bW, bH);
+  }
+
+  // No vector tree overlay — the hybrid heatmap already shows the tree
+  // structure through the distance field (red at branch centers, smooth
+  // Gaussian mixture falloff everywhere else)
+}
+
+// ================================================================
+// Flow velocity using SOFT (inflated) distribution
+// ================================================================
+const N_STEPS = 12;
+
+function flowVelocitySoft(x, y, t) {
+  const tc = Math.max(1e-5, Math.min(1 - 1e-5, t));
+  const omt = 1 - tc;
+  const noiseVar = omt * omt * SIGMA2;
+
+  // Use soft comps for the posterior computation
+  const nearby = nearbySoftComps(x, y, Math.sqrt(noiseVar) * 3);
+
+  let sumW = 0, Ex = 0, Ey = 0;
+
+  for (const k of nearby) {
+    const c = SOFT_COMPS[k];
+    const mS00 = c.S[0][0] + noiseVar;
+    const mS01 = c.S[0][1];
+    const mS11 = c.S[1][1] + noiseVar;
+    const mDet = mS00 * mS11 - mS01 * mS01;
+    if (Math.abs(mDet) < 1e-30) continue;
+
+    const mI00 = mS11 / mDet, mI01 = -mS01 / mDet, mI11 = mS00 / mDet;
+    const dx = x - c.mu[0], dy = y - c.mu[1];
+    const m = dx * dx * mI00 + 2 * dx * dy * mI01 + dy * dy * mI11;
+    if (m > 50) continue;
+    const w = c.phi * Math.exp(-0.5 * m) / (6.2832 * Math.sqrt(mDet));
+
+    // Posterior mean of x_1 given x_t under this component
+    const pS00 = c.S[0][0] + noiseVar;
+    const pS01 = c.S[0][1];
+    const pS11 = c.S[1][1] + noiseVar;
+    const pDet = pS00 * pS11 - pS01 * pS01;
+    if (Math.abs(pDet) < 1e-30) {
+      sumW += w; Ex += w * c.mu[0]; Ey += w * c.mu[1]; continue;
+    }
+    const pI00 = pS11 / pDet, pI01 = -pS01 / pDet, pI11 = pS00 / pDet;
+
+    const rx = x - c.mu[0], ry = y - c.mu[1];
+    const Pr0 = pI00 * rx + pI01 * ry;
+    const Pr1 = pI01 * rx + pI11 * ry;
+    const Kx = c.S[0][0] * Pr0 + c.S[0][1] * Pr1;
+    const Ky = c.S[0][1] * Pr0 + c.S[1][1] * Pr1;
+
+    const postX = c.mu[0] + Kx;
+    const postY = c.mu[1] + Ky;
+
+    sumW += w;
+    Ex += w * postX;
+    Ey += w * postY;
+  }
+
+  if (sumW < 1e-30) return [0, 0];
+  Ex /= sumW; Ey /= sumW;
+  return [(Ex - x) / omt, (Ey - y) / omt];
+}
+
+// ================================================================
+// ODE integration + Jacobian accumulation (using soft velocity)
+// ================================================================
+let odePath = [];
+let odeJacs = [];
+let x0 = [VX0 + (VX1 - VX0) * STYLE.initX0[0], VY0 + span * STYLE.initX0[1]];
+
+function integrateODE() {
+  odePath = []; odeJacs = [];
+  const tS = 0.01, tE = 0.995, tR = tE - tS, dt = tR / N_STEPS;
+  let px = x0[0], py = x0[1];
+  for (let s = 0; s <= N_STEPS; s++) {
+    const t = tS + s / N_STEPS * tR;
+    odePath.push({ pos: [px, py], t: t });
+    if (s < N_STEPS) {
+      const [vx, vy] = flowVelocitySoft(px, py, t);
+      px += vx * dt; py += vy * dt;
+    }
+  }
+  // Jacobian accumulation (backward)
+  odeJacs = new Array(N_STEPS + 1);
+  odeJacs[N_STEPS] = [[1, 0], [0, 1]];
+  for (let s = N_STEPS - 1; s >= 0; s--) {
+    const [px2, py2] = odePath[s].pos;
+    const t = odePath[s].t;
+    const h = 5e-4;
+    const dt2 = tR / N_STEPS;
+    const vxp = flowVelocitySoft(px2 + h, py2, t), vxm = flowVelocitySoft(px2 - h, py2, t);
+    const vyp = flowVelocitySoft(px2, py2 + h, t), vym = flowVelocitySoft(px2, py2 - h, t);
+    const dvdx = [
+      [(vxp[0] - vxm[0]) / (2 * h), (vyp[0] - vym[0]) / (2 * h)],
+      [(vxp[1] - vxm[1]) / (2 * h), (vyp[1] - vym[1]) / (2 * h)]
+    ];
+    const sJ = [
+      [1 + dt2 * dvdx[0][0], dt2 * dvdx[0][1]],
+      [dt2 * dvdx[1][0], 1 + dt2 * dvdx[1][1]]
+    ];
+    const J = odeJacs[s + 1];
+    odeJacs[s] = [
+      [J[0][0] * sJ[0][0] + J[0][1] * sJ[1][0], J[0][0] * sJ[0][1] + J[0][1] * sJ[1][1]],
+      [J[1][0] * sJ[0][0] + J[1][1] * sJ[1][0], J[1][0] * sJ[0][1] + J[1][1] * sJ[1][1]]
+    ];
+  }
+}
+
+// ================================================================
+// Interpolation helpers
+// ================================================================
+function lerpPos(f) {
+  const lo = Math.floor(f), hi = Math.min(lo + 1, N_STEPS);
+  const a = f - lo;
+  return [
+    odePath[lo].pos[0] * (1 - a) + odePath[hi].pos[0] * a,
+    odePath[lo].pos[1] * (1 - a) + odePath[hi].pos[1] * a
+  ];
+}
+function lerpJac(f) {
+  const lo = Math.floor(f), hi = Math.min(lo + 1, N_STEPS);
+  const a = f - lo;
+  const A = odeJacs[lo], B = odeJacs[hi];
+  return [
+    [A[0][0] * (1 - a) + B[0][0] * a, A[0][1] * (1 - a) + B[0][1] * a],
+    [A[1][0] * (1 - a) + B[1][0] * a, A[1][1] * (1 - a) + B[1][1] * a]
+  ];
+}
+
+// ================================================================
+// State
+// ================================================================
+let fgCanvas, fgCtx, W, H, dpr;
+let gradAngle = Math.PI * 0.6;
+let viewStepF = 0;
+let isDrag = false, dragTarget = null;
+let isDraggingX0 = false;
+const isMobile = window.innerWidth <= 600;
+const SLIDER_RES = 200;
+
+let autoPlaying = true;
+let animPhase = 'forward';
+let animStartTime = 0;
+let backpropPos = 0;
+let fadeAlpha = 1;
+let lastInteractionTime = 0;
+const AUTO_RESUME_DELAY = 5000;
+
+// ================================================================
+// Coord mapping
+// ================================================================
+function d2p(dx, dy) { return [(dx - VX0) / (VX1 - VX0) * W, (VY1 - dy) / (VY1 - VY0) * H]; }
+function p2d(px, py) { return [px / W * (VX1 - VX0) + VX0, VY1 - py / H * (VY1 - VY0)]; }
+
+// ================================================================
+// Math helpers
+// ================================================================
+const m2v = (A, v) => [A[0][0] * v[0] + A[0][1] * v[1], A[1][0] * v[0] + A[1][1] * v[1]];
+const m2T = A => [[A[0][0], A[1][0]], [A[0][1], A[1][1]]];
+const vl = v => Math.sqrt(v[0] * v[0] + v[1] * v[1]);
+const vn = v => { const l = vl(v); return l > 1e-15 ? [v[0] / l, v[1] / l] : [1, 0] };
+const vd = (a, b) => a[0] * b[0] + a[1] * b[1];
+const aVec = (a, b) => Math.acos(Math.max(-1, Math.min(1, vd(vn(a), vn(b)))));
+
+// Color interpolation for angle deviation (Portland-themed)
+function aC(deg) {
+  const t = Math.min(Math.abs(deg) / 90, 1);
+  // 0 deg = teal (aligned), 45 deg = yellow, 90 deg = red (Portland scale)
+  const n = [10, 136, 186];   // 0A88BA teal
+  const m = [242, 211, 56];   // F2D338 yellow
+  const b = [217, 30, 30];    // D91E1E red
+  if (t < 0.5) { const s = t * 2; return `rgb(${0 | n[0] + (m[0] - n[0]) * s},${0 | n[1] + (m[1] - n[1]) * s},${0 | n[2] + (m[2] - n[2]) * s})` }
+  const s = (t - 0.5) * 2; return `rgb(${0 | m[0] + (b[0] - m[0]) * s},${0 | m[1] + (b[1] - m[1]) * s},${0 | m[2] + (b[2] - m[2]) * s})`
+}
+
+// ================================================================
+// Drawing helpers
+// ================================================================
+function arrow(x1, y1, x2, y2, col, lw, hs) {
+  const dx = x2 - x1, dy = y2 - y1, len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 2) return;
+  fgCtx.strokeStyle = col; fgCtx.fillStyle = col; fgCtx.lineWidth = lw;
+  fgCtx.lineCap = 'round'; fgCtx.lineJoin = 'round';
+  const sf = Math.max(0, 1 - hs / len);
+  fgCtx.beginPath(); fgCtx.moveTo(x1, y1); fgCtx.lineTo(x1 + dx * sf, y1 + dy * sf); fgCtx.stroke();
+  const a = Math.atan2(dy, dx), ha = 0.38;
+  fgCtx.beginPath(); fgCtx.moveTo(x2, y2);
+  fgCtx.lineTo(x2 - hs * Math.cos(a - ha), y2 - hs * Math.sin(a - ha));
+  fgCtx.lineTo(x2 - hs * .28 * Math.cos(a), y2 - hs * .28 * Math.sin(a));
+  fgCtx.lineTo(x2 - hs * Math.cos(a + ha), y2 - hs * Math.sin(a + ha));
+  fgCtx.closePath(); fgCtx.fill();
+}
+
+// ================================================================
+// Render foreground
+// ================================================================
+function render() {
+  if (!fgCtx) return;
+  fgCtx.save(); fgCtx.scale(dpr, dpr);
+  fgCtx.clearRect(0, 0, W, H);
+
+  if (odePath.length === 0) { fgCtx.restore(); return; }
+
+  const gDir = [Math.cos(gradAngle), Math.sin(gradAngle)];
+  const arrowLen = (VX1 - VX0) * STYLE.arrowFrac;
+
+  const curF = viewStepF;
+  const curPos = lerpPos(curF);
+
+  const inBackward = (animPhase === 'backward');
+  const inHold = (animPhase === 'hold');
+  const inFade = (animPhase === 'fade');
+
+  const isForwardAuto = (animPhase === 'forward' && autoPlaying);
+
+  // -- Path rendering --
+  if (isForwardAuto) {
+    // Dotted hint line during forward phase
+    fgCtx.strokeStyle = rgba(STYLE.pathRGB, STYLE.hintAlpha);
+    fgCtx.lineWidth = STYLE.hintWidth;
+    fgCtx.setLineDash(STYLE.hintDash);
+    fgCtx.lineCap = 'round'; fgCtx.lineJoin = 'round';
+    fgCtx.beginPath();
+    for (let s = 0; s <= N_STEPS; s++) {
+      const [px, py] = d2p(odePath[s].pos[0], odePath[s].pos[1]);
+      s === 0 ? fgCtx.moveTo(px, py) : fgCtx.lineTo(px, py);
+    }
+    fgCtx.stroke();
+    fgCtx.setLineDash([]);
+  } else {
+    // Full path shadow
+    fgCtx.strokeStyle = rgba([0, 0, 0], STYLE.pathShadowAlpha); fgCtx.lineWidth = STYLE.pathShadowW;
+    fgCtx.lineJoin = 'round'; fgCtx.lineCap = 'round';
+    fgCtx.beginPath();
+    for (let s = 0; s <= N_STEPS; s++) {
+      const [px, py] = d2p(odePath[s].pos[0], odePath[s].pos[1]);
+      s === 0 ? fgCtx.moveTo(px, py) : fgCtx.lineTo(px, py);
+    }
+    fgCtx.stroke();
+
+    // Full path (dimmed)
+    fgCtx.strokeStyle = rgba(STYLE.pathRGB, STYLE.pathDimAlpha); fgCtx.lineWidth = STYLE.pathDimW;
+    fgCtx.beginPath();
+    for (let s = 0; s <= N_STEPS; s++) {
+      const [px, py] = d2p(odePath[s].pos[0], odePath[s].pos[1]);
+      s === 0 ? fgCtx.moveTo(px, py) : fgCtx.lineTo(px, py);
+    }
+    fgCtx.stroke();
+  }
+
+  // Active path (up to current position, bright)
+  {
+    const upTo = Math.floor(curF);
+    fgCtx.strokeStyle = rgba(STYLE.pathRGB, STYLE.pathActiveAlpha); fgCtx.lineWidth = STYLE.pathActiveW;
+    fgCtx.beginPath();
+    for (let s = 0; s <= upTo; s++) {
+      const [px, py] = d2p(odePath[s].pos[0], odePath[s].pos[1]);
+      s === 0 ? fgCtx.moveTo(px, py) : fgCtx.lineTo(px, py);
+    }
+    const [cpx2, cpy2] = d2p(curPos[0], curPos[1]);
+    if (upTo < N_STEPS) fgCtx.lineTo(cpx2, cpy2);
+    fgCtx.stroke();
+  }
+
+  // Directional arrowheads along path
+  for (let s = 0; s < N_STEPS; s++) {
+    const active = s < curF;
+    if (isForwardAuto && !active) continue;
+    const [px0, py0] = d2p(odePath[s].pos[0], odePath[s].pos[1]);
+    const [px1, py1] = d2p(odePath[s + 1].pos[0], odePath[s + 1].pos[1]);
+    const mx = (px0 + px1) / 2, my = (py0 + py1) / 2;
+    const sdx = px1 - px0, sdy = py1 - py0;
+    const slen = Math.sqrt(sdx * sdx + sdy * sdy);
+    if (slen < 2) continue;
+    const sa = Math.atan2(sdy, sdx);
+    const col = active ? rgba(STYLE.pathRGB, STYLE.chevronActiveAlpha) : rgba(STYLE.greyRGB, STYLE.chevronInactiveAlpha);
+    const sz = STYLE.chevronSize;
+    const ha = STYLE.chevronHalf;
+    fgCtx.fillStyle = col;
+    fgCtx.beginPath();
+    fgCtx.moveTo(mx + Math.cos(sa) * sz, my + Math.sin(sa) * sz);
+    fgCtx.lineTo(mx - sz * Math.cos(sa - ha), my - sz * Math.sin(sa - ha));
+    fgCtx.lineTo(mx - sz * Math.cos(sa + ha), my - sz * Math.sin(sa + ha));
+    fgCtx.closePath(); fgCtx.fill();
+  }
+
+  // Start and end dots
+  for (const s of [0, N_STEPS]) {
+    const [px, py] = d2p(odePath[s].pos[0], odePath[s].pos[1]);
+    const active = s <= curF;
+    // Dark outline dot
+    fgCtx.fillStyle = rgba([0, 0, 0], 0.3);
+    fgCtx.beginPath(); fgCtx.arc(px, py, STYLE.dotOuterR + 1, 0, 6.2832); fgCtx.fill();
+    fgCtx.fillStyle = active ? rgba(STYLE.pathRGB, 0.7) : rgba(STYLE.greyRGB, 0.25);
+    fgCtx.beginPath(); fgCtx.arc(px, py, STYLE.dotInnerR, 0, 6.2832); fgCtx.fill();
+  }
+
+  // Current position indicator
+  {
+    const [cpx, cpy] = d2p(curPos[0], curPos[1]);
+    fgCtx.fillStyle = rgba([0, 0, 0], 0.3);
+    fgCtx.beginPath(); fgCtx.arc(cpx, cpy, STYLE.cursorOuterR + 1, 0, 6.2832); fgCtx.fill();
+    fgCtx.fillStyle = STYLE.pathHex;
+    fgCtx.beginPath(); fgCtx.arc(cpx, cpy, STYLE.cursorInnerR, 0, 6.2832); fgCtx.fill();
+    fgCtx.strokeStyle = STYLE.pathHex; fgCtx.lineWidth = STYLE.cursorRingW;
+    fgCtx.beginPath(); fgCtx.arc(cpx, cpy, STYLE.cursorOuterR, 0, 6.2832); fgCtx.stroke();
+  }
+
+  // x0 handle
+  {
+    const [px, py] = d2p(x0[0], x0[1]);
+    fgCtx.strokeStyle = rgba(STYLE.pathRGB, 0.45); fgCtx.lineWidth = 1.5; fgCtx.setLineDash([4, 4]);
+    fgCtx.beginPath(); fgCtx.arc(px, py, STYLE.x0HandleR, 0, 6.2832); fgCtx.stroke(); fgCtx.setLineDash([]);
+    fgCtx.fillStyle = STYLE.pathHex; fgCtx.font = 'bold 10px Arial'; fgCtx.textAlign = 'center'; fgCtx.textBaseline = 'bottom';
+    fgCtx.fillText('x\u2080', px, py - 15);
+  }
+
+  // Labels for start/end
+  {
+    const [sx, sy] = d2p(odePath[0].pos[0], odePath[0].pos[1]);
+    fgCtx.font = 'bold 11px Arial';
+    fgCtx.fillStyle = rgba([255, 255, 255], 0.7);
+    fgCtx.textAlign = 'center'; fgCtx.textBaseline = 'bottom';
+    fgCtx.fillText('t\u2080 (noise)', sx, sy - 16);
+
+    const [ex, ey] = d2p(odePath[N_STEPS].pos[0], odePath[N_STEPS].pos[1]);
+    fgCtx.fillStyle = rgba([255, 255, 255], 0.7);
+    fgCtx.textAlign = 'center'; fgCtx.textBaseline = 'top';
+    fgCtx.fillText('t\u2081 (data)', ex, ey + 16);
+  }
+
+  const [cpx, cpy] = d2p(curPos[0], curPos[1]);
+
+  // -- Gradient arrows --
+  const curJ = lerpJac(curF), curJT = m2T(curJ);
+  const eG = m2v(curJT, gDir);
+  const eDir = vn(eG);
+  const aDeg = aVec(eG, gDir) * 180 / Math.PI;
+  const isAtEnd = (curF >= N_STEPS - 0.01);
+
+  if (isDraggingX0) {
+    // No arrows during drag
+  } else if (isForwardAuto) {
+    // No arrows during forward phase
+  } else if ((inBackward || inHold || inFade) && autoPlaying) {
+    const globalFade = (inFade) ? fadeAlpha : 1;
+
+    for (let s = 0; s <= N_STEPS; s++) {
+      const [ppx, ppy] = d2p(odePath[s].pos[0], odePath[s].pos[1]);
+      const pJ = odeJacs[s], pJT = m2T(pJ);
+      const pG = m2v(pJT, gDir);
+      const pDir = vn(pG);
+      const pDeg = aVec(pG, gDir) * 180 / Math.PI;
+      const col = s === N_STEPS ? STYLE.burgundy : aC(pDeg);
+
+      let growFactor;
+      if (inHold || inFade) {
+        growFactor = 1;
+      } else {
+        const waveFront = backpropPos;
+        const halfW = STYLE.waveFrontWidth / 2;
+        if (s < waveFront - halfW) {
+          continue;
+        } else if (s >= waveFront + halfW) {
+          growFactor = 1;
+        } else {
+          const t = (s - (waveFront - halfW)) / STYLE.waveFrontWidth;
+          growFactor = t * t * (3 - 2 * t);
+          if (growFactor < 0.02) continue;
+        }
+      }
+
+      const curLen = arrowLen * growFactor;
+      const tx = odePath[s].pos[0] + pDir[0] * curLen;
+      const ty = odePath[s].pos[1] + pDir[1] * curLen;
+      const [tpx, tpy] = d2p(tx, ty);
+
+      const alpha = STYLE.trailAlphaFloor * growFactor * globalFade;
+      const lw = STYLE.trailW * Math.max(growFactor, 0.3);
+      const hs = STYLE.trailHead * Math.max(growFactor, 0.3);
+
+      fgCtx.globalAlpha = alpha;
+      if (growFactor > 0.3) {
+        arrow(ppx, ppy, tpx, tpy, col, lw, hs);
+      } else {
+        fgCtx.strokeStyle = col; fgCtx.lineWidth = lw; fgCtx.lineCap = 'round';
+        fgCtx.beginPath(); fgCtx.moveTo(ppx, ppy); fgCtx.lineTo(tpx, tpy); fgCtx.stroke();
+      }
+      fgCtx.globalAlpha = 1;
+    }
+  } else if (!autoPlaying) {
+    // Manual mode: trail arrows + hero
+    for (let s = 0; s <= N_STEPS; s++) {
+      if (Math.abs(s - curF) < 0.5) continue;
+
+      const [ppx, ppy] = d2p(odePath[s].pos[0], odePath[s].pos[1]);
+      const pJ = odeJacs[s], pJT = m2T(pJ);
+      const pG = m2v(pJT, gDir);
+      const pDir = vn(pG);
+      const pDeg = aVec(pG, gDir) * 180 / Math.PI;
+      const dLen = arrowLen;
+
+      const dist = Math.abs(s - curF);
+      const baseAlpha = Math.max(STYLE.trailAlphaFloor, STYLE.trailAlpha - dist * STYLE.trailAlphaFade);
+
+      const tx = odePath[s].pos[0] + pDir[0] * dLen, ty = odePath[s].pos[1] + pDir[1] * dLen;
+      const [tpx, tpy] = d2p(tx, ty);
+      fgCtx.globalAlpha = baseAlpha;
+      arrow(ppx, ppy, tpx, tpy, s === N_STEPS ? STYLE.burgundy : aC(pDeg), STYLE.trailW, STYLE.trailHead);
+      fgCtx.globalAlpha = 1;
+    }
+
+    // Hero arrow at current position
+    const bigLen = arrowLen * STYLE.heroScale;
+    const tx = curPos[0] + eDir[0] * bigLen;
+    const ty = curPos[1] + eDir[1] * bigLen;
+    const [tpx, tpy] = d2p(tx, ty);
+    const col = isAtEnd ? STYLE.burgundy : aC(aDeg);
+    fgCtx.globalAlpha = 0.4;
+    arrow(cpx, cpy, tpx, tpy, rgba([0, 0, 0], 0.5), STYLE.heroShadowW, STYLE.heroShadowHead);
+    fgCtx.globalAlpha = 1;
+    arrow(cpx, cpy, tpx, tpy, col, STYLE.heroW, STYLE.heroHead);
+  }
+
+  // Gradient direction legend
+  drawGradLegend(fgCtx);
+
+  fgCtx.restore();
+}
+
+// ================================================================
+// Gradient direction legend (top-right)
+// ================================================================
+function legendCenter() {
+  return [W - STYLE.legendMargin - STYLE.legendR, STYLE.legendMargin + STYLE.legendR];
+}
+
+function drawGradLegend(ctx) {
+  const [cx, cy] = legendCenter();
+
+  // Outer circle (semi-transparent dark)
+  ctx.fillStyle = rgba([20, 15, 60], 0.75);
+  ctx.strokeStyle = rgba([255, 255, 255], 0.25);
+  ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(cx, cy, STYLE.legendR, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+
+  // Tick marks
+  ctx.strokeStyle = rgba([255, 255, 255], 0.15); ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const a = i * Math.PI / 2;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(a) * (STYLE.legendR - 6), cy + Math.sin(a) * (STYLE.legendR - 6));
+    ctx.lineTo(cx + Math.cos(a) * (STYLE.legendR - 2), cy + Math.sin(a) * (STYLE.legendR - 2));
+    ctx.stroke();
+  }
+
+  // Arrow
+  const sA = -gradAngle;
+  const ax = Math.cos(sA) * STYLE.legendArrow, ay = Math.sin(sA) * STYLE.legendArrow;
+  const tipX = cx + ax, tipY = cy + ay;
+
+  const hs = STYLE.legendHeadSize;
+  const aa = Math.atan2(ay, ax);
+  const shaftEndX = tipX - hs * 0.6 * Math.cos(aa), shaftEndY = tipY - hs * 0.6 * Math.sin(aa);
+  ctx.strokeStyle = STYLE.pathHex; ctx.lineWidth = STYLE.legendShaftW; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(cx - ax * 0.3, cy - ay * 0.3); ctx.lineTo(shaftEndX, shaftEndY); ctx.stroke();
+
+  const ha = STYLE.legendHeadHalf;
+  ctx.fillStyle = STYLE.pathHex;
+  ctx.beginPath(); ctx.moveTo(tipX, tipY);
+  ctx.lineTo(tipX - hs * Math.cos(aa - ha), tipY - hs * Math.sin(aa - ha));
+  ctx.lineTo(tipX - hs * Math.cos(aa + ha), tipY - hs * Math.sin(aa + ha));
+  ctx.closePath(); ctx.fill();
+
+  // Label
+  ctx.fillStyle = STYLE.pathHex; ctx.font = 'bold 11px Arial';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('Reward Gradient', cx, cy + STYLE.legendR + 12);
+
+  // Drag hint ring
+  ctx.strokeStyle = rgba([255, 255, 255], 0.1); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.arc(cx, cy, STYLE.legendR + 4, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+}
+
+function hitLegend(mx, my) {
+  const [cx, cy] = legendCenter();
+  return Math.sqrt((mx - cx) ** 2 + (my - cy) ** 2) < STYLE.legendR + STYLE.legendHitPad;
+}
+
+// ================================================================
+// Auto-animation
+// ================================================================
+function startAnimation() {
+  restartForwardAnimation();
+}
+
+function resumeAuto() {
+  startAnimation();
+}
+
+function animationTick(now) {
+  requestAnimationFrame(animationTick);
+
+  if (!autoPlaying && lastInteractionTime > 0) {
+    if (now - lastInteractionTime > AUTO_RESUME_DELAY) {
+      lastInteractionTime = 0;
+      startAnimation();
+    }
+  }
+
+  if (!autoPlaying) {
+    render();
+    return;
+  }
+
+  const elapsed = (now - animStartTime) / 1000;
+
+  if (animPhase === 'forward') {
+    const progress = Math.min(1, elapsed / STYLE.forwardDuration);
+    const eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+    viewStepF = eased * N_STEPS;
+    syncSlider();
+
+    if (progress >= 1) {
+      viewStepF = N_STEPS;
+      animPhase = 'backward';
+      animStartTime = now;
+      backpropPos = N_STEPS + STYLE.waveFrontWidth / 2;
+    }
+  } else if (animPhase === 'backward') {
+    const startPos = N_STEPS + STYLE.waveFrontWidth / 2;
+    const endPos = -STYLE.waveFrontWidth / 2;
+    const progress = Math.min(1, elapsed / STYLE.backwardDuration);
+    const eased = progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+    backpropPos = startPos + (endPos - startPos) * eased;
+
+    viewStepF = N_STEPS;
+    syncSlider();
+
+    if (progress >= 1) {
+      backpropPos = endPos;
+      animPhase = 'hold';
+      animStartTime = now;
+      fadeAlpha = 1;
+    }
+  } else if (animPhase === 'hold') {
+    if (elapsed >= STYLE.holdDuration) {
+      animPhase = 'fade';
+      animStartTime = now;
+      fadeAlpha = 1;
+    }
+  } else if (animPhase === 'fade') {
+    const progress = Math.min(1, elapsed / STYLE.fadeDuration);
+    fadeAlpha = 1 - progress * progress;
+
+    if (progress >= 1) {
+      fadeAlpha = 0;
+      animPhase = 'pause';
+      animStartTime = now;
+    }
+  } else if (animPhase === 'pause') {
+    if (elapsed >= STYLE.pauseDuration) {
+      animPhase = 'forward';
+      animStartTime = now;
+      viewStepF = 0;
+      backpropPos = N_STEPS + STYLE.waveFrontWidth / 2;
+      fadeAlpha = 1;
+    }
+  }
+
+  render();
+}
+
+// ================================================================
+// Interaction
+// ================================================================
+let rafPending = false;
+function cXY(e) {
+  const r = fgCanvas.getBoundingClientRect();
+  const cx = (e.touches ? e.touches[0].clientX : e.clientX);
+  const cy = (e.touches ? e.touches[0].clientY : e.clientY);
+  return [(cx - r.left) * W / r.width, (cy - r.top) * H / r.height];
+}
+function restartForwardAnimation() {
+  autoPlaying = true;
+  animPhase = 'forward';
+  animStartTime = performance.now();
+  viewStepF = 0;
+  backpropPos = N_STEPS + STYLE.waveFrontWidth / 2;
+  fadeAlpha = 1;
+  document.getElementById('resumeLink').style.display = 'none';
+  syncSlider();
+}
+function pauseAutoForInteraction() {
+  autoPlaying = false;
+  lastInteractionTime = performance.now();
+  document.getElementById('resumeLink').style.display = 'inline';
+}
+function showFullPathImmediate() {
+  autoPlaying = false;
+  animPhase = 'forward';
+  viewStepF = N_STEPS;
+  backpropPos = N_STEPS + STYLE.waveFrontWidth / 2;
+  fadeAlpha = 1;
+  lastInteractionTime = 0;
+  document.getElementById('resumeLink').style.display = 'none';
+  syncSlider();
+}
+function onDown(e) {
+  const [mx, my] = cXY(e);
+  if (hitLegend(mx, my)) {
+    e.preventDefault(); isDrag = true; dragTarget = 'grad';
+    onMove(e); return;
+  }
+  e.preventDefault(); isDrag = true; dragTarget = 'x0'; isDraggingX0 = true;
+  const [dx, dy] = p2d(mx, my);
+  x0 = [dx, dy];
+  integrateODE();
+  showFullPathImmediate();
+  render();
+}
+function onMove(e) {
+  if (!isDrag) return; e.preventDefault();
+  const [mx, my] = cXY(e);
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    if (!isDrag) return;
+    if (dragTarget === 'grad') {
+      const [lcx, lcy] = legendCenter();
+      const ddx = mx - lcx, ddy = my - lcy;
+      if (Math.abs(ddx) > 2 || Math.abs(ddy) > 2) gradAngle = Math.atan2(-ddy, ddx);
+      render();
+    } else {
+      const [ddx, ddy] = p2d(mx, my);
+      x0 = [ddx, ddy];
+      integrateODE();
+      showFullPathImmediate();
+      render();
+    }
+  });
+}
+function onUp() {
+  if (isDrag && dragTarget === 'x0') {
+    isDrag = false; dragTarget = null; isDraggingX0 = false;
+    restartForwardAnimation();
+    return;
+  }
+  isDrag = false; dragTarget = null;
+}
+
+// ================================================================
+// Controls
+// ================================================================
+function stepFToT(f) {
+  const tS = 0.01, tE = 0.995;
+  return tS + (f / N_STEPS) * (tE - tS);
+}
+function syncSlider() {
+  const slider = document.getElementById('stepSlider');
+  slider.value = Math.round(viewStepF / N_STEPS * SLIDER_RES);
+  document.getElementById('stepVal').textContent = stepFToT(viewStepF).toFixed(2);
+}
+
+// ================================================================
+// Init
+// ================================================================
+function initFg() {
+  fgCanvas = document.getElementById('fg');
+  fgCtx = fgCanvas.getContext('2d');
+  dpr = window.devicePixelRatio || 1;
+  const box = document.getElementById('box');
+  const r = box.getBoundingClientRect();
+  W = r.width; H = r.height;
+  fgCanvas.width = W * dpr; fgCanvas.height = H * dpr;
+  fgCanvas.style.width = W + 'px'; fgCanvas.style.height = H + 'px';
+}
+
+function setup() {
+  // Compute the heatmap first (heavy work)
+  computeHeatmap();
+
+  // Render background: heatmap + vector tree
+  renderBackground();
+  document.getElementById('loadMsg').style.display = 'none';
+
+  initFg();
+  integrateODE();
+
+  document.getElementById('stepVal').textContent = '0.01';
+
+  render();
+
+  fgCanvas.addEventListener('mousedown', onDown);
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+  fgCanvas.addEventListener('touchstart', onDown, { passive: false });
+  document.addEventListener('touchmove', onMove, { passive: false });
+  document.addEventListener('touchend', onUp);
+
+  document.getElementById('stepSlider').addEventListener('input', function (e) {
+    viewStepF = parseInt(e.target.value) / SLIDER_RES * N_STEPS;
+    document.getElementById('stepVal').textContent = stepFToT(viewStepF).toFixed(2);
+    pauseAutoForInteraction();
+    render();
+  });
+
+  let rt;
+  window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { renderBackground(); initFg(); render(); }, 200); });
+
+  startAnimation();
+  requestAnimationFrame(animationTick);
+}
+
+requestAnimationFrame(() => setTimeout(setup, 50));
+</script>
+</body>
+</html>
