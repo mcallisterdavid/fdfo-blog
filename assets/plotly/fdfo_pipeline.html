@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FDFO Generation Pipeline</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #050532;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2px 12px 2px;
+    overflow-x: hidden;
+  }
+  h2 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #050532;
+    margin-bottom: 2px;
+    text-align: center;
+  }
+  .subtitle {
+    font-size: 0.85rem;
+    color: #656C75;
+    margin-bottom: 4px;
+    text-align: center;
+  }
+  .pipeline-wrap {
+    width: 100%;
+    max-width: 840px;
+    overflow-x: auto;
+    overflow-y: visible;
+    margin-bottom: 0;
+    -webkit-overflow-scrolling: touch;
+  }
+  .pipeline-wrap::-webkit-scrollbar { height: 4px; }
+  .pipeline-wrap::-webkit-scrollbar-thumb { background: rgba(5,5,50,0.15); border-radius: 2px; }
+  svg#pipeline { display: block; margin: 0 auto; }
+  .caption {
+    font-size: 0.78rem;
+    color: #656C75;
+    max-width: 650px;
+    text-align: center;
+    line-height: 1.45;
+  }
+  .tooltip-box {
+    position: fixed;
+    pointer-events: none;
+    background: #050532;
+    color: #FAF8F5;
+    font-size: 0.78rem;
+    padding: 8px 12px;
+    border-radius: 6px;
+    max-width: 240px;
+    line-height: 1.4;
+    z-index: 100;
+    opacity: 0;
+    transition: opacity 0.15s;
+    font-family: inherit;
+    box-shadow: 0 4px 16px rgba(5,5,50,0.25);
+    white-space: pre-line;
+  }
+  .tooltip-box::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: #050532;
+  }
+</style>
+</head>
+<body>
+
+<h2>Flow Matching Generation Pipeline</h2>
+<p class="subtitle">Noise &rarr; denoising steps &rarr; clean sample &rarr; reward</p>
+
+<div class="pipeline-wrap">
+  <svg id="pipeline" xmlns="http://www.w3.org/2000/svg" width="840" height="156" viewBox="0 0 840 156"></svg>
+</div>
+
+
+<div class="tooltip-box" id="tooltip"></div>
+
+<script>
+(function() {
+  // ---- Constants ----
+  var NAVY = '#050532';
+  var BURG = '#732424';
+  var SLATE = '#656C75';
+  var TERRA = '#AB8064';
+  var CREAM = '#FAF8F5';
+
+  var NS = 'http://www.w3.org/2000/svg';
+  var svg = document.getElementById('pipeline');
+  var tooltip = document.getElementById('tooltip');
+
+  // ---- Stage definitions ----
+  var BOX_H = 66;
+  var BOX_Y = 42;
+  var R = 8; // corner radius
+
+  var stages = [
+    { id:'noise',  label:'x\u2080', sub:'Gaussian Noise', w:88,  color:SLATE, tip:'Gaussian noise x\u2080 ~ N(0, I)\nRandom starting point \u2014 no structure, just samples from the prior.' },
+    { id:'s1',     label:'Step 1',  sub:'t = 0.0',        w:72,  color:NAVY,  tip:'First denoising step.\nThe velocity field v(x,t) begins steering noise toward the data distribution.' },
+    { id:'s2',     label:'Step 2',  sub:'t = 0.25',       w:72,  color:NAVY,  tip:'Intermediate step.\nNoise is reduced as the ODE integrator follows v(x,t). Coarse features emerge.' },
+    { id:'dots',   label:'\u00B7\u00B7\u00B7', sub:'',    w:36,  color:null,  tip:null }, // ellipsis
+    { id:'sT',     label:'Step T',  sub:'t = 1.0',        w:72,  color:NAVY,  tip:'Final denoising step.\nThe ODE converges to a clean sample x\u2081 on the data manifold.' },
+    { id:'sample', label:'x\u2081', sub:'Clean Sample',   w:88,  color:TERRA, tip:'Generated sample x\u2081.\nA clean output from the flow model, ready for reward evaluation.' },
+    { id:'reward', label:'R(\u00B7)',sub:'Reward Model',   w:88,  color:BURG,  tip:'Reward model R(\u00B7).\nEvaluates the generated sample \u2014 e.g. PickScore, a VLM reward, or any quality metric.' },
+    { id:'score',  label:'r',       sub:'Score',          w:62,  color:BURG,  tip:'Scalar reward r = R(x\u2081).\nFDFO backpropagates \u2207r through the Jacobian of the entire sampling chain.' }
+  ];
+
+  // Compute x positions
+  var ARROW_GAP = 24;
+  var xPos = [];
+  var cx = 16;
+  for (var i = 0; i < stages.length; i++) {
+    xPos.push(cx);
+    cx += stages[i].w;
+    if (i < stages.length - 1) cx += ARROW_GAP;
+  }
+
+  // ---- SVG helpers ----
+  function el(tag, attrs) {
+    var e = document.createElementNS(NS, tag);
+    if (attrs) for (var k in attrs) {
+      if (k === 'textContent') e.textContent = attrs[k];
+      else e.setAttribute(k, attrs[k]);
+    }
+    return e;
+  }
+
+  // ---- Noise dots inside a box ----
+  function noiseDotsGroup(bx, by, bw, bh, density, seed) {
+    var g = el('g');
+    var s = seed || 42;
+    function rng() { s = (s * 16807 + 0) % 2147483647; return s / 2147483647; }
+    var n = Math.round(density * 40);
+    for (var i = 0; i < n; i++) {
+      var dx = bx + 8 + rng() * (bw - 16);
+      var dy = by + 8 + rng() * (bh - 16);
+      var r = 1 + rng() * 1.2;
+      g.appendChild(el('circle', { cx: dx, cy: dy, r: r, fill: 'rgba(5,5,50,0.18)' }));
+    }
+    return g;
+  }
+
+  // Wavy line icon
+  function wavyIcon(cx, cy, phase) {
+    var pts = [];
+    for (var t = -10; t <= 10; t++) {
+      pts.push((cx + t) + ',' + (cy + 3 * Math.sin((t + phase) * 0.55)));
+    }
+    return el('polyline', { points: pts.join(' '), fill: 'none', stroke: 'rgba(255,255,255,0.4)', 'stroke-width': '1.5', 'stroke-linecap': 'round' });
+  }
+
+  // ---- Draw stages ----
+  var stageGroups = [];
+  var midY = BOX_Y + BOX_H / 2;
+
+  for (var i = 0; i < stages.length; i++) {
+    var s = stages[i];
+    var x = xPos[i];
+
+    if (s.id === 'dots') {
+      // Just three dots
+      var dg = el('g');
+      for (var d = 0; d < 3; d++) {
+        dg.appendChild(el('circle', { cx: x + 8 + d * 10, cy: midY, r: 2.5, fill: SLATE }));
+      }
+      svg.appendChild(dg);
+      stageGroups.push(null);
+      continue;
+    }
+
+    var g = el('g', { style: 'cursor:pointer' });
+
+    // Box fill
+    g.appendChild(el('rect', {
+      x: x, y: BOX_Y, width: s.w, height: BOX_H,
+      rx: R, ry: R, fill: s.color
+    }));
+
+    // Inner decorations based on stage type
+    var iconCx = x + s.w / 2;
+    var iconCy = BOX_Y + 20;
+
+    if (s.id === 'noise') {
+      g.appendChild(noiseDotsGroup(x, BOX_Y, s.w, BOX_H, 1.0, 111));
+    } else if (s.id.startsWith('s') && s.id !== 'sample' && s.id !== 'score') {
+      // Denoising steps: wavy velocity icon
+      var phase = i * 4;
+      g.appendChild(wavyIcon(iconCx, iconCy, phase));
+    } else if (s.id === 'sample') {
+      // Small frame icon
+      g.appendChild(el('rect', { x: iconCx - 11, y: iconCy - 9, width: 22, height: 18, rx: 2, fill: 'none', stroke: 'rgba(255,255,255,0.45)', 'stroke-width': '1.2' }));
+      var pts = (iconCx-7)+','+(iconCy+6)+' '+(iconCx-2)+','+(iconCy-1)+' '+(iconCx+3)+','+(iconCy+3)+' '+(iconCx+7)+','+(iconCy-4);
+      g.appendChild(el('polyline', { points: pts, fill: 'none', stroke: 'rgba(255,255,255,0.4)', 'stroke-width': '1', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
+    } else if (s.id === 'reward') {
+      // Star icon
+      var starPts = [];
+      for (var si = 0; si < 5; si++) {
+        var a1 = -Math.PI / 2 + si * 2 * Math.PI / 5;
+        starPts.push((iconCx + 8 * Math.cos(a1)) + ',' + (iconCy + 8 * Math.sin(a1)));
+        var a2 = a1 + Math.PI / 5;
+        starPts.push((iconCx + 4 * Math.cos(a2)) + ',' + (iconCy + 4 * Math.sin(a2)));
+      }
+      g.appendChild(el('polygon', { points: starPts.join(' '), fill: 'rgba(255,255,255,0.35)', stroke: 'rgba(255,255,255,0.55)', 'stroke-width': '0.8' }));
+    } else if (s.id === 'score') {
+      // Hash/number icon
+      g.appendChild(el('text', { x: iconCx, y: iconCy + 2, 'text-anchor': 'middle', 'dominant-baseline': 'middle', 'font-size': '16', 'font-weight': '700', fill: 'rgba(255,255,255,0.45)', 'font-family': 'Georgia, serif', textContent: '#' }));
+    }
+
+    // Main label
+    g.appendChild(el('text', {
+      x: x + s.w / 2, y: BOX_Y + 44,
+      'text-anchor': 'middle', 'dominant-baseline': 'middle',
+      'font-size': '13', 'font-weight': '700', fill: '#fff',
+      'font-family': 'Georgia, serif',
+      textContent: s.label
+    }));
+
+    // Sub-label below box
+    if (s.sub) {
+      g.appendChild(el('text', {
+        x: x + s.w / 2, y: BOX_Y + BOX_H + 16,
+        'text-anchor': 'middle', 'dominant-baseline': 'middle',
+        'font-size': '10.5', fill: SLATE,
+        textContent: s.sub
+      }));
+    }
+
+    svg.appendChild(g);
+    stageGroups.push(g);
+
+    // Tooltip
+    (function(stage, group) {
+      if (!stage.tip) return;
+      group.addEventListener('mouseenter', function(e) {
+        tooltip.textContent = stage.tip;
+        tooltip.style.opacity = '1';
+      });
+      group.addEventListener('mousemove', function(e) {
+        var tw = 240;
+        var tx = e.clientX - tw / 2;
+        var ty = e.clientY - 65;
+        if (tx < 4) tx = 4;
+        if (tx + tw > window.innerWidth - 4) tx = window.innerWidth - tw - 4;
+        tooltip.style.left = tx + 'px';
+        tooltip.style.top = ty + 'px';
+      });
+      group.addEventListener('mouseleave', function() { tooltip.style.opacity = '0'; });
+    })(s, g);
+  }
+
+  // ---- Arrows between stages ----
+  for (var i = 0; i < stages.length - 1; i++) {
+    var fromX = xPos[i] + stages[i].w + 2;
+    var toX = xPos[i + 1] - 2;
+    // Skip arrows adjacent to the dots stage — draw arrows from/to dots differently
+    if (stages[i].id === 'dots' || stages[i + 1].id === 'dots') {
+      // Thin line, no arrowhead for dots
+      svg.appendChild(el('line', {
+        x1: fromX, y1: midY, x2: toX, y2: midY,
+        stroke: SLATE, 'stroke-width': '1.2', 'stroke-dasharray': '3,3'
+      }));
+    } else {
+      svg.appendChild(el('line', {
+        x1: fromX, y1: midY, x2: toX - 5, y2: midY,
+        stroke: SLATE, 'stroke-width': '1.5'
+      }));
+      svg.appendChild(el('polygon', {
+        points: toX + ',' + midY + ' ' + (toX - 7) + ',' + (midY - 3.5) + ' ' + (toX - 7) + ',' + (midY + 3.5),
+        fill: SLATE
+      }));
+    }
+  }
+
+  // ---- Section brackets ----
+  var bracketY = BOX_Y - 14;
+
+  // Forward pass bracket (noise through step T)
+  var fwdLeft = xPos[0] + 8;
+  var fwdRight = xPos[4] + stages[4].w - 8;
+  svg.appendChild(el('line', {
+    x1: fwdLeft, y1: bracketY, x2: fwdRight, y2: bracketY,
+    stroke: NAVY, 'stroke-width': '1', 'stroke-dasharray': '4,3'
+  }));
+  svg.appendChild(el('text', {
+    x: (fwdLeft + fwdRight) / 2, y: bracketY - 8,
+    'text-anchor': 'middle', 'font-size': '10.5', fill: NAVY,
+    'font-weight': '600', 'letter-spacing': '0.4',
+    textContent: 'FORWARD PASS (GENERATION)'
+  }));
+
+  // Reward evaluation bracket
+  var rewLeft = xPos[5] + 8;
+  var rewRight = xPos[7] + stages[7].w - 8;
+  svg.appendChild(el('line', {
+    x1: rewLeft, y1: bracketY, x2: rewRight, y2: bracketY,
+    stroke: BURG, 'stroke-width': '1', 'stroke-dasharray': '4,3'
+  }));
+  svg.appendChild(el('text', {
+    x: (rewLeft + rewRight) / 2, y: bracketY - 8,
+    'text-anchor': 'middle', 'font-size': '10.5', fill: BURG,
+    'font-weight': '600', 'letter-spacing': '0.4',
+    textContent: 'REWARD EVALUATION'
+  }));
+
+  // ---- Backward gradient arrow ----
+  var gradY = BOX_Y + BOX_H + 44;
+  var gradLeft = xPos[0] + stages[0].w / 2;
+  var gradRight = xPos[7] + stages[7].w / 2;
+
+  svg.appendChild(el('line', {
+    x1: gradRight, y1: gradY, x2: gradLeft + 7, y2: gradY,
+    stroke: TERRA, 'stroke-width': '1.5', 'stroke-dasharray': '6,4'
+  }));
+  svg.appendChild(el('polygon', {
+    points: (gradLeft + 2) + ',' + gradY + ' ' + (gradLeft + 9) + ',' + (gradY - 4) + ' ' + (gradLeft + 9) + ',' + (gradY + 4),
+    fill: TERRA
+  }));
+  svg.appendChild(el('text', {
+    x: (gradLeft + gradRight) / 2, y: gradY - 8,
+    'text-anchor': 'middle', 'font-size': '10', fill: TERRA,
+    'font-weight': '600', 'letter-spacing': '0.3',
+    textContent: 'REWARD REINFORCEMENT UPDATE'
+  }));
+
+})();
+</script>
+
+</body>
+</html>

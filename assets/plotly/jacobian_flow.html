@@ -1,0 +1,1127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jacobian Gradient Transport — Fractal Tree</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:Arial,sans-serif;background:#fff}
+.wrap{height:100%;display:flex;flex-direction:column;align-items:center;padding:0 12px 6px}
+.cbox{flex:0 0 auto;width:100%;aspect-ratio:1.4/1;max-height:calc(100vh - 100px);border-radius:16px;overflow:hidden;background:#FAF8F5;cursor:crosshair;position:relative}
+#bg,#fg{border-radius:16px}
+#bg{position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:auto}
+#fg{position:absolute;top:0;left:0;width:100%;height:100%}
+.srow{display:flex;align-items:center;justify-content:center;gap:12px;margin:12px auto 0;max-width:480px}
+.srow label{font:bold 13px Arial;color:#050532;white-space:nowrap}
+.srow .v{color:#050532;min-width:36px;text-align:right}
+input[type=range]{flex:1;height:5px;border-radius:5px;background:#ddd;outline:none;-webkit-appearance:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#050532;cursor:pointer}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:#050532;cursor:pointer;border:none}
+.cap{text-align:center;margin-top:10px;color:#656C75;font-size:13px;line-height:1.5}
+.cap a{color:#050532;cursor:pointer;text-decoration:underline}
+.loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font:bold 16px Arial;color:#050532}
+@media(max-width:600px){.wrap{padding:0 8px 4px}.cap{font-size:11px}input[type=range]::-webkit-slider-thumb{width:26px;height:26px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="cbox" id="box">
+    <canvas id="bg"></canvas>
+    <canvas id="fg"></canvas>
+    <div class="loading" id="loadMsg">Rendering tree...</div>w
+  </div>
+  <div class="srow">
+    <label>t = <span class="v" id="stepVal">0.00</span></label>
+    <input type="range" id="stepSlider" min="0" max="200" value="0" step="1">
+  </div>
+  <div class="cap">
+    The reward gradient is transported backward through the sampling chain via the Jacobian of each step.
+    <b>Click</b> to reposition the noise sample, <b>drag the dial</b> to rotate the gradient direction.
+    <a id="resumeLink" style="display:none" onclick="resumeAuto()">Resume animation</a>
+  </div>
+</div>
+
+<script>
+// ================================================================
+// Style constants — edit these to tune colors, sizes, and weights
+// ================================================================
+// Note: CSS above uses the same palette (search for hex codes to match).
+const STYLE = {
+  // ── Color palette ──
+  bg:        '#FAF8F5',           // cream paper background
+  bgRGB:     [250, 248, 245],    // same in RGB
+  navyRGB:   [5, 5, 50],         // trunk & deep branches
+  navyHex:   '#050532',          // navy as hex (labels, text)
+  tipsRGB:   [85, 64, 50],    // branch tips (warm terracotta)
+  pathRGB:   [192, 112, 90],     // sampling chain (reddish terracotta)
+  pathHex:   '#C0705A',          // same in hex
+  burgundy:  '#732424',          // reward gradient, play button accent
+  grey:      '#656C75',          // captions, inactive elements
+  greyRGB:   [101, 108, 117],    // same in RGB
+
+  // ── Angle-deviation color stops (used by aC function) ──
+  // 0 deg = navyRGB, 45 deg = angleMidRGB, 90 deg = angleBadRGB
+  angleMidRGB: [5, 5, 50],  // moderate deviation (= tipsRGB)
+  angleBadRGB: [5, 5, 50],    // severe deviation (burgundy-ish)
+
+  // ── Tree: glow pass (wide soft outer strokes) ──
+  glowBase: 22, glowDecay: 0.60, glowFloor: 4,
+  glowAlpha: 0.05, glowAlphaDecay: 0.72, glowAlphaFloor: 0.02,
+
+  // ── Tree: mid-glow pass (medium body strokes) ──
+  midBase: 6, midDecay: 0.60, midFloor: 3,
+  midAlpha: 0.13, midAlphaDecay: 0.75, midAlphaFloor: 0.04,
+
+  // ── Tree: taper pass (filled quads, crisp core) ──
+  taperWidth: 12.0, taperDecay: 0.68,
+  taperFloorBase: 1.4, taperFloorTip: 0.9,
+  taperAlpha: 0.95, taperAlphaStep: 0.06, taperAlphaFloor: 0.55,
+
+  // ── Tree: highlight pass (bright center line) ──
+  hlWidth: 1.5, hlDecay: 0.55, hlFloor: 0.3,
+  hlAlpha: 0.15, hlAlphaDecay: 0.6, hlMaxDepth: 5,
+
+  // ── Sampling path ──
+  pathShadowW: 4, pathShadowAlpha: 0.5,
+  pathDimAlpha: 1.0, pathDimW: 5,
+  pathActiveAlpha: 1.0, pathActiveW: 5.5,
+  chevronSize: 2, chevronHalf: 0.3,
+  chevronActiveAlpha: 0.55, chevronInactiveAlpha: 0.2,
+  dotOuterR: 5, dotInnerR: 3.5,
+  cursorOuterR: 7, cursorInnerR: 5, cursorRingW: 2,
+  x0HandleR: 14,
+
+  // ── Gradient arrows ──
+  arrowFrac: 0.045,   // arrow length as fraction of view width
+  heroScale: 1.5,     // hero arrow = arrowLen * this
+  trailW: 1.8, trailHead: 7,
+  trailAlpha: 0.2, trailAlphaFade: 0, trailAlphaFloor: 0.8,
+  heroW: 3.5, heroHead: 12, heroShadowW: 6, heroShadowHead: 14,
+
+  // ── Legend (gradient dial, top-right) ──
+  legendR: 36, legendMargin: 20, legendArrow: 24,
+  legendHeadSize: 10, legendHeadHalf: 0.45,
+  legendShaftW: 2.5, legendHitPad: 12,
+
+  // ── View padding & aspect ratio ──
+  canvasAR: 1.4,      // width:height of plot (1 = square, >1 = landscape)
+  padLoFrac: 0.06,    // padding below/left of origin
+  padHiFrac: 0.42,    // padding above/right (room for noise sample)
+  initX0: [0.72, 0.68], // initial noise sample position (fraction of span)
+
+  // ── Auto-animation timing ──
+  forwardDuration: 3.0,   // seconds for forward sampling phase
+  backwardDuration: 4.5,  // seconds for backward wave to traverse the full chain
+  holdDuration: 1.0,      // seconds to hold all arrows visible at full size
+  fadeDuration: 0.8,      // seconds for all arrows to fade out together
+  pauseDuration: 0.5,     // seconds after fade before restarting forward
+
+  // ── Backward wave shape ──
+  // The wave front sweeps from N_STEPS down to 0.
+  // waveFrontWidth controls how many steps are in the "growing" transition zone.
+  // Arrows behind the front: fully grown. At the front: growing. Ahead: invisible.
+  waveFrontWidth: 3.0,    // number of steps the growth transition spans
+
+  // ── Dotted hint line (forward phase) ──
+  hintDash: [4, 8],       // dash pattern for hint line
+  hintAlpha: 0.15,        // opacity of hint line
+  hintWidth: 1.5,         // stroke width of hint line
+};
+
+// Helper: format [r,g,b] array + alpha into CSS rgba string
+function rgba(rgb, a){ return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`; }
+
+// ================================================================
+// Seeded PRNG (mulberry32)
+// ================================================================
+function mb32(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function mkGauss(rng){return function(){const u=rng(),v=rng();return Math.sqrt(-2*Math.log(u+1e-12))*Math.cos(6.2832*v)}}
+
+// ================================================================
+// Build fractal tree distribution (autoguidance style)
+// ================================================================
+const COMPS=[];  // {mu:[2], S:[[2x2]], Sinv:[[2x2]], det:f, phi:f, cls:str}
+const BRANCHES=[]; // {x0,y0,x1,y1,depth,cls} — branch segments in data coords (scaled)
+
+function buildTree(){
+  const rng=mb32(2);
+  const gauss=mkGauss(rng);
+  const origin=[0.0030,0.0325];
+  const scale=[1.3136,1.3844];
+
+  function recurse(cls,depth,pos,angle){
+    if(depth>=7)return;
+    const cdx=Math.cos(angle),cdy=Math.sin(angle);
+    const distR=gauss()*0.2+1;
+    const dist=0.292*Math.pow(0.8,depth)*distR;
+    const thick=Math.min(0.2*Math.pow(0.8,depth)/dist, 0.999); // clamp to avoid degenerate covariance
+    const sz0=scale[0]*dist*0.06, sz1=scale[1]*dist*0.06;
+    const phi=dist*Math.pow(0.5,depth);
+
+    // Store branch segment for vector rendering
+    BRANCHES.push({
+      x0:pos[0]*scale[0], y0:pos[1]*scale[1],
+      x1:(pos[0]+cdx*dist)*scale[0], y1:(pos[1]+cdy*dist)*scale[1],
+      depth:depth, cls:cls
+    });
+
+    for(let i=0;i<8;i++){
+      const t=0.07+(0.93-0.07)*i/7;
+      const mx=(pos[0]+cdx*dist*t)*scale[0];
+      const my=(pos[1]+cdy*dist*t)*scale[1];
+      // Covariance: S = dir*dir^T * (sz^2 - thick^2*sz^2) + thick^2*sz^2 * I
+      // This creates an ellipse elongated along the branch direction
+      const a00=sz0*sz0, a11=sz1*sz1;
+      const b00=thick*thick*a00, b11=thick*thick*a11;
+      const S00=cdx*cdx*(a00-b00)+b00;
+      const S01=cdx*cdy*Math.sqrt(Math.abs((a00-b00)*(a11-b11)))*Math.sign(a00-b00);
+      const S11=cdy*cdy*(a11-b11)+b11;
+      const det=S00*S11-S01*S01;
+      if(det<1e-30)continue;
+      const idet=1/det;
+      COMPS.push({
+        mu:[mx,my],
+        S:[[S00,S01],[S01,S11]],
+        Sinv:[[S11*idet,-S01*idet],[-S01*idet,S00*idet]],
+        det:det,
+        phi:phi,
+        cls:cls,
+        depth:depth
+      });
+    }
+    for(const sign of[1,-1]){
+      const angleNew=angle+sign*Math.pow(0.7,depth)*(gauss()*0.2+1);
+      recurse(cls,depth+1,[pos[0]+cdx*dist,pos[1]+cdy*dist],angleNew);
+    }
+  }
+
+  recurse('A',0,[origin[0],origin[1]],Math.PI*0.25);
+  recurse('B',0,[origin[0],origin[1]],Math.PI*1.25);
+}
+buildTree();
+
+// ================================================================
+// View bounds — top-right quadrant only (branch A)
+// ================================================================
+const ORIGIN_SX=0.0030*1.3136, ORIGIN_SY=0.0325*1.3844;
+let VX0=ORIGIN_SX,VX1=-Infinity,VY0=ORIGIN_SY,VY1=-Infinity;
+for(const c of COMPS){
+  if(c.cls!=='A')continue;
+  const r=3*Math.sqrt(Math.max(c.S[0][0],c.S[1][1]));
+  VX1=Math.max(VX1,c.mu[0]+r);
+  VY1=Math.max(VY1,c.mu[1]+r);
+}
+// Small padding below/left of origin so trunk isn't clipped
+const padLo=STYLE.padLoFrac*Math.max(VX1-VX0,VY1-VY0);
+VX0-=padLo; VY0-=padLo;
+// Padding on the top/right — tree fills ~65% of canvas,
+// leaving room in the upper-right for the initial noise sample.
+const padHi=STYLE.padHiFrac*Math.max(VX1-VX0,VY1-VY0);
+VX1+=padHi; VY1+=padHi;
+// Make square base, then extend horizontally for landscape aspect ratio
+const span=Math.max(VX1-VX0,VY1-VY0);
+VX1=VX0+span; VY1=VY0+span;
+if(STYLE.canvasAR>1){
+  // Extend rightward — more room in the noise region
+  VX1=VX0+span*STYLE.canvasAR;
+}
+
+// ================================================================
+// Spatial index for fast component lookup
+// ================================================================
+const GRID_CELLS=32;
+const spatialGrid=new Array(GRID_CELLS*GRID_CELLS);
+for(let i=0;i<spatialGrid.length;i++)spatialGrid[i]=[];
+
+function cellIdx(x,y){
+  const ci=Math.floor((x-VX0)/(VX1-VX0)*GRID_CELLS);
+  const cj=Math.floor((y-VY0)/(VY1-VY0)*GRID_CELLS);
+  return[Math.max(0,Math.min(GRID_CELLS-1,ci)),Math.max(0,Math.min(GRID_CELLS-1,cj))];
+}
+
+for(let k=0;k<COMPS.length;k++){
+  const c=COMPS[k];
+  const r=4*Math.sqrt(Math.max(c.S[0][0],c.S[1][1]));
+  const[ci0,cj0]=cellIdx(c.mu[0]-r,c.mu[1]-r);
+  const[ci1,cj1]=cellIdx(c.mu[0]+r,c.mu[1]+r);
+  for(let ci=ci0;ci<=ci1;ci++)for(let cj=cj0;cj<=cj1;cj++){
+    spatialGrid[cj*GRID_CELLS+ci].push(k);
+  }
+}
+
+function nearbyComps(x,y,extraR){
+  const r=extraR+SIGMA_MAX;
+  const[ci0,cj0]=cellIdx(x-r,y-r);
+  const[ci1,cj1]=cellIdx(x+r,y+r);
+  const seen=new Set();
+  const result=[];
+  for(let ci=ci0;ci<=ci1;ci++)for(let cj=cj0;cj<=cj1;cj++){
+    for(const k of spatialGrid[cj*GRID_CELLS+ci]){
+      if(!seen.has(k)){seen.add(k);result.push(k);}
+    }
+  }
+  return result;
+}
+
+// ================================================================
+// Vector rendering of fractal tree on background canvas
+// ================================================================
+const MAX_DEPTH=6; // max depth is 6 (recurse stops at depth>=7)
+
+function branchRGB(depth){
+  const t=depth/MAX_DEPTH;
+  const n=STYLE.navyRGB, p=STYLE.tipsRGB;
+  return[
+    Math.round(n[0]+(p[0]-n[0])*t),
+    Math.round(n[1]+(p[1]-n[1])*t),
+    Math.round(n[2]+(p[2]-n[2])*t)
+  ];
+}
+
+function renderVectorTree(){
+  const bgC=document.getElementById('bg');
+  const bgDpr=window.devicePixelRatio||1;
+  const box=document.getElementById('box');
+  const rect=box.getBoundingClientRect();
+  const bW=rect.width, bH=rect.height;
+  bgC.width=bW*bgDpr; bgC.height=bH*bgDpr;
+  bgC.style.width=bW+'px'; bgC.style.height=bH+'px';
+  const ctx=bgC.getContext('2d');
+  ctx.scale(bgDpr,bgDpr);
+
+  ctx.fillStyle=STYLE.bg;
+  ctx.fillRect(0,0,bW,bH);
+
+  const scX=bW/(VX1-VX0), scY=bH/(VY1-VY0);
+  function toP(dx,dy){return[(dx-VX0)*scX,(VY1-dy)*scY];}
+
+  // Sort branches: deepest first so trunk paints over tips
+  const sorted=BRANCHES.slice().sort((a,b)=>b.depth-a.depth);
+
+  ctx.lineCap='round';
+  ctx.lineJoin='round';
+
+  // === Pass 1: wide soft glow strokes for density envelope ===
+  for(const br of sorted){
+    const[px0,py0]=toP(br.x0,br.y0);
+    const[px1,py1]=toP(br.x1,br.y1);
+    const[cr,cg,cb]=branchRGB(br.depth);
+    const glowW=Math.max(STYLE.glowFloor, STYLE.glowBase*Math.pow(STYLE.glowDecay,br.depth));
+    const glowAlpha=Math.max(STYLE.glowAlphaFloor, STYLE.glowAlpha*Math.pow(STYLE.glowAlphaDecay,br.depth));
+    ctx.strokeStyle=`rgba(${cr},${cg},${cb},${glowAlpha})`;
+    ctx.lineWidth=glowW;
+    ctx.beginPath();ctx.moveTo(px0,py0);ctx.lineTo(px1,py1);ctx.stroke();
+  }
+
+  // === Pass 2: medium glow for body ===
+  for(const br of sorted){
+    const[px0,py0]=toP(br.x0,br.y0);
+    const[px1,py1]=toP(br.x1,br.y1);
+    const[cr,cg,cb]=branchRGB(br.depth);
+    const midW=Math.max(STYLE.midFloor, STYLE.midBase*Math.pow(STYLE.midDecay,br.depth));
+    const midAlpha=Math.max(STYLE.midAlphaFloor, STYLE.midAlpha*Math.pow(STYLE.midAlphaDecay,br.depth));
+    ctx.strokeStyle=`rgba(${cr},${cg},${cb},${midAlpha})`;
+    ctx.lineWidth=midW;
+    ctx.beginPath();ctx.moveTo(px0,py0);ctx.lineTo(px1,py1);ctx.stroke();
+  }
+
+  // === Pass 3: tapered filled branch shapes (crisp core) ===
+  for(const br of sorted){
+    const[px0,py0]=toP(br.x0,br.y0);
+    const[px1,py1]=toP(br.x1,br.y1);
+    const dx=px1-px0, dy=py1-py0;
+    const len=Math.sqrt(dx*dx+dy*dy);
+    if(len<0.5)continue;
+    const nx=-dy/len, ny=dx/len;
+
+    const wBase=Math.max(STYLE.taperFloorBase, STYLE.taperWidth*Math.pow(STYLE.taperDecay,br.depth));
+    const wTip =Math.max(STYLE.taperFloorTip, STYLE.taperWidth*Math.pow(STYLE.taperDecay,br.depth+1));
+
+    const[cr,cg,cb]=branchRGB(br.depth);
+    const alpha=Math.max(STYLE.taperAlphaFloor, STYLE.taperAlpha-br.depth*STYLE.taperAlphaStep);
+
+    ctx.fillStyle=`rgba(${cr},${cg},${cb},${alpha})`;
+    ctx.beginPath();
+    ctx.moveTo(px0+nx*wBase/2, py0+ny*wBase/2);
+    ctx.lineTo(px1+nx*wTip/2,  py1+ny*wTip/2);
+    ctx.lineTo(px1-nx*wTip/2,  py1-ny*wTip/2);
+    ctx.lineTo(px0-nx*wBase/2, py0-ny*wBase/2);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // === Pass 4: thin bright highlight along branch centers ===
+  for(const br of sorted){
+    if(br.depth>STYLE.hlMaxDepth)continue;
+    const[px0,py0]=toP(br.x0,br.y0);
+    const[px1,py1]=toP(br.x1,br.y1);
+    const hlW=Math.max(STYLE.hlFloor, STYLE.hlWidth*Math.pow(STYLE.hlDecay,br.depth));
+    const hlAlpha=STYLE.hlAlpha*Math.pow(STYLE.hlAlphaDecay,br.depth);
+    ctx.strokeStyle=rgba(STYLE.bgRGB, hlAlpha);
+    ctx.lineWidth=hlW;
+    ctx.beginPath();ctx.moveTo(px0,py0);ctx.lineTo(px1,py1);ctx.stroke();
+  }
+}
+
+// ================================================================
+// Flow matching ODE — variance-exploding (VE) schedule
+// ================================================================
+const N_STEPS=12;
+const SIGMA_MAX=0.7;
+const SIGMA2=SIGMA_MAX*SIGMA_MAX;
+
+function flowVelocity(x,y,t){
+  const tc=Math.max(1e-5,Math.min(1-1e-5,t));
+  const omt=1-tc; // (1-t)
+  const noiseVar=omt*omt*SIGMA2; // (1-t)^2 * sigma^2
+
+  // Search radius depends on noise level
+  const nearby=nearbyComps(x,y,Math.sqrt(noiseVar)*3);
+
+  let sumW=0, Ex=0, Ey=0;
+
+  for(const k of nearby){
+    const c=COMPS[k];
+    const mS00=c.S[0][0]+noiseVar;
+    const mS01=c.S[0][1];
+    const mS11=c.S[1][1]+noiseVar;
+    const mDet=mS00*mS11-mS01*mS01;
+    if(Math.abs(mDet)<1e-30)continue;
+
+    const mI00=mS11/mDet, mI01=-mS01/mDet, mI11=mS00/mDet;
+    const dx=x-c.mu[0], dy=y-c.mu[1];
+    const m=dx*dx*mI00+2*dx*dy*mI01+dy*dy*mI11;
+    if(m>50)continue;
+    const w=c.phi*Math.exp(-0.5*m)/(6.2832*Math.sqrt(mDet));
+
+    const pS00=c.S[0][0]+noiseVar;
+    const pS01=c.S[0][1];
+    const pS11=c.S[1][1]+noiseVar;
+    const pDet=pS00*pS11-pS01*pS01;
+    if(Math.abs(pDet)<1e-30){
+      sumW+=w; Ex+=w*c.mu[0]; Ey+=w*c.mu[1]; continue;
+    }
+    const pI00=pS11/pDet, pI01=-pS01/pDet, pI11=pS00/pDet;
+
+    const rx=x-c.mu[0], ry=y-c.mu[1];
+    const Pr0=pI00*rx+pI01*ry;
+    const Pr1=pI01*rx+pI11*ry;
+    const Kx=c.S[0][0]*Pr0+c.S[0][1]*Pr1;
+    const Ky=c.S[0][1]*Pr0+c.S[1][1]*Pr1;
+
+    const postX=c.mu[0]+Kx;
+    const postY=c.mu[1]+Ky;
+
+    sumW+=w;
+    Ex+=w*postX;
+    Ey+=w*postY;
+  }
+
+  if(sumW<1e-30)return[0,0];
+  Ex/=sumW; Ey/=sumW;
+  return[(Ex-x)/omt,(Ey-y)/omt];
+}
+
+// ================================================================
+// ODE integration + Jacobian accumulation
+// ================================================================
+let odePath=[];
+let odeJacs=[];
+// Initial noise sample — upper-right of view (noisy region, away from data)
+let x0=[VX0+(VX1-VX0)*STYLE.initX0[0], VY0+span*STYLE.initX0[1]];
+
+function integrateODE(){
+  odePath=[];odeJacs=[];
+  const tS=0.01, tE=0.995, tR=tE-tS, dt=tR/N_STEPS;
+  let px=x0[0], py=x0[1];
+  for(let s=0;s<=N_STEPS;s++){
+    const t=tS+s/N_STEPS*tR;
+    odePath.push({pos:[px,py],t:t});
+    if(s<N_STEPS){
+      const[vx,vy]=flowVelocity(px,py,t);
+      px+=vx*dt; py+=vy*dt;
+    }
+  }
+  // Jacobian accumulation (backward from data to noise)
+  odeJacs=new Array(N_STEPS+1);
+  odeJacs[N_STEPS]=[[1,0],[0,1]];
+  for(let s=N_STEPS-1;s>=0;s--){
+    const[px2,py2]=odePath[s].pos;
+    const t=odePath[s].t;
+    const h=5e-4;
+    const vxp=flowVelocity(px2+h,py2,t), vxm=flowVelocity(px2-h,py2,t);
+    const vyp=flowVelocity(px2,py2+h,t), vym=flowVelocity(px2,py2-h,t);
+    const dvdx=[
+      [(vxp[0]-vxm[0])/(2*h), (vyp[0]-vym[0])/(2*h)],
+      [(vxp[1]-vxm[1])/(2*h), (vyp[1]-vym[1])/(2*h)]
+    ];
+    const sJ=[
+      [1+dt*dvdx[0][0], dt*dvdx[0][1]],
+      [dt*dvdx[1][0], 1+dt*dvdx[1][1]]
+    ];
+    const J=odeJacs[s+1];
+    odeJacs[s]=[
+      [J[0][0]*sJ[0][0]+J[0][1]*sJ[1][0], J[0][0]*sJ[0][1]+J[0][1]*sJ[1][1]],
+      [J[1][0]*sJ[0][0]+J[1][1]*sJ[1][0], J[1][0]*sJ[0][1]+J[1][1]*sJ[1][1]]
+    ];
+  }
+}
+
+// ================================================================
+// Interpolation helpers for smooth slider
+// ================================================================
+function lerpPos(f){
+  const lo=Math.floor(f), hi=Math.min(lo+1,N_STEPS);
+  const a=f-lo;
+  return[
+    odePath[lo].pos[0]*(1-a)+odePath[hi].pos[0]*a,
+    odePath[lo].pos[1]*(1-a)+odePath[hi].pos[1]*a
+  ];
+}
+function lerpJac(f){
+  const lo=Math.floor(f), hi=Math.min(lo+1,N_STEPS);
+  const a=f-lo;
+  const A=odeJacs[lo], B=odeJacs[hi];
+  return[
+    [A[0][0]*(1-a)+B[0][0]*a, A[0][1]*(1-a)+B[0][1]*a],
+    [A[1][0]*(1-a)+B[1][0]*a, A[1][1]*(1-a)+B[1][1]*a]
+  ];
+}
+
+// ================================================================
+// State
+// ================================================================
+let fgCanvas,fgCtx,W,H,dpr;
+let gradAngle=Math.PI*0.6;
+let viewStepF=0; // float in [0, N_STEPS]
+let isDrag=false, dragTarget=null;
+let isDraggingX0=false; // true while user is actively dragging the x0 handle
+const isMobile=window.innerWidth<=600;
+const SLIDER_RES=200; // slider range is 0..SLIDER_RES
+
+// ================================================================
+// Auto-animation state
+// ================================================================
+let autoPlaying=true;
+let animPhase='forward'; // 'forward' | 'backward' | 'hold' | 'fade' | 'pause'
+let animStartTime=0;     // performance.now() when this phase started
+let backpropPos=0;       // continuous float for backward wave front position (N_STEPS -> 0)
+let fadeAlpha=1;          // global alpha for all arrows during fade phase (1 -> 0)
+let lastInteractionTime=0; // for auto-resume after idle
+const AUTO_RESUME_DELAY=5000; // ms of idle before auto-resuming
+
+// ================================================================
+// Coord mapping
+// ================================================================
+function d2p(dx,dy){return[(dx-VX0)/(VX1-VX0)*W,(VY1-dy)/(VY1-VY0)*H];}
+function p2d(px,py){return[px/W*(VX1-VX0)+VX0,VY1-py/H*(VY1-VY0)];}
+
+// ================================================================
+// Math helpers
+// ================================================================
+const m2v=(A,v)=>[A[0][0]*v[0]+A[0][1]*v[1],A[1][0]*v[0]+A[1][1]*v[1]];
+const m2T=A=>[[A[0][0],A[1][0]],[A[0][1],A[1][1]]];
+const vl=v=>Math.sqrt(v[0]*v[0]+v[1]*v[1]);
+const vn=v=>{const l=vl(v);return l>1e-15?[v[0]/l,v[1]/l]:[1,0]};
+const vd=(a,b)=>a[0]*b[0]+a[1]*b[1];
+const aVec=(a,b)=>Math.acos(Math.max(-1,Math.min(1,vd(vn(a),vn(b)))));
+
+// Color interpolation for angle deviation
+function aC(deg){
+  const t=Math.min(Math.abs(deg)/90,1);
+  const n=STYLE.navyRGB, m=STYLE.angleMidRGB, b=STYLE.angleBadRGB;
+  if(t<0.5){const s=t*2;return`rgb(${0|n[0]+(m[0]-n[0])*s},${0|n[1]+(m[1]-n[1])*s},${0|n[2]+(m[2]-n[2])*s})`}
+  const s=(t-0.5)*2;return`rgb(${0|m[0]+(b[0]-m[0])*s},${0|m[1]+(b[1]-m[1])*s},${0|m[2]+(b[2]-m[2])*s})`
+}
+
+// ================================================================
+// Drawing helpers
+// ================================================================
+function arrow(x1,y1,x2,y2,col,lw,hs){
+  const dx=x2-x1,dy=y2-y1,len=Math.sqrt(dx*dx+dy*dy);
+  if(len<2)return;
+  fgCtx.strokeStyle=col;fgCtx.fillStyle=col;fgCtx.lineWidth=lw;
+  fgCtx.lineCap='round';fgCtx.lineJoin='round';
+  const sf=Math.max(0,1-hs/len);
+  fgCtx.beginPath();fgCtx.moveTo(x1,y1);fgCtx.lineTo(x1+dx*sf,y1+dy*sf);fgCtx.stroke();
+  const a=Math.atan2(dy,dx),ha=0.38;
+  fgCtx.beginPath();fgCtx.moveTo(x2,y2);
+  fgCtx.lineTo(x2-hs*Math.cos(a-ha),y2-hs*Math.sin(a-ha));
+  fgCtx.lineTo(x2-hs*.28*Math.cos(a),y2-hs*.28*Math.sin(a));
+  fgCtx.lineTo(x2-hs*Math.cos(a+ha),y2-hs*Math.sin(a+ha));
+  fgCtx.closePath();fgCtx.fill();
+}
+
+// ================================================================
+// Render foreground (path + arrows)
+// ================================================================
+function render(){
+  if(!fgCtx)return;
+  fgCtx.save();fgCtx.scale(dpr,dpr);
+  fgCtx.clearRect(0,0,W,H);
+
+  if(odePath.length===0){fgCtx.restore();return;}
+
+  const gDir=[Math.cos(gradAngle),Math.sin(gradAngle)];
+  const arrowLen=(VX1-VX0)*STYLE.arrowFrac;
+
+  // Current continuous position
+  const curF=viewStepF;
+  const curPos=lerpPos(curF);
+
+  // Determine which arrows to show based on animation phase
+  const inBackward=(animPhase==='backward');
+  const inHold=(animPhase==='hold');
+  const inFade=(animPhase==='fade');
+  const now=performance.now();
+
+  // -- Path rendering --
+  const isForwardAuto=(animPhase==='forward'&&autoPlaying);
+  if(isForwardAuto){
+    // During forward phase: draw the full ODE trajectory as a dotted hint line
+    fgCtx.strokeStyle=rgba(STYLE.pathRGB, STYLE.hintAlpha);
+    fgCtx.lineWidth=STYLE.hintWidth;
+    fgCtx.setLineDash(STYLE.hintDash);
+    fgCtx.lineCap='round';fgCtx.lineJoin='round';
+    fgCtx.beginPath();
+    for(let s=0;s<=N_STEPS;s++){
+      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
+    }
+    fgCtx.stroke();
+    fgCtx.setLineDash([]);
+  } else {
+    // Backward/pause/manual: full path shadow + full path
+    fgCtx.strokeStyle=rgba(STYLE.bgRGB, STYLE.pathShadowAlpha);fgCtx.lineWidth=STYLE.pathShadowW;
+    fgCtx.lineJoin='round';fgCtx.lineCap='round';
+    fgCtx.beginPath();
+    for(let s=0;s<=N_STEPS;s++){
+      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
+    }
+    fgCtx.stroke();
+
+    // Full path (dim terracotta)
+    fgCtx.strokeStyle=rgba(STYLE.pathRGB, STYLE.pathDimAlpha);fgCtx.lineWidth=STYLE.pathDimW;
+    fgCtx.beginPath();
+    for(let s=0;s<=N_STEPS;s++){
+      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
+    }
+    fgCtx.stroke();
+  }
+
+  // -- Active path (up to current continuous position, strong terracotta) --
+  {
+    const upTo=Math.floor(curF);
+    fgCtx.strokeStyle=rgba(STYLE.pathRGB, STYLE.pathActiveAlpha);fgCtx.lineWidth=STYLE.pathActiveW;
+    fgCtx.beginPath();
+    for(let s=0;s<=upTo;s++){
+      const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+      s===0?fgCtx.moveTo(px,py):fgCtx.lineTo(px,py);
+    }
+    // Interpolate to exact current position
+    const[cpx2,cpy2]=d2p(curPos[0],curPos[1]);
+    if(upTo<N_STEPS) fgCtx.lineTo(cpx2,cpy2);
+    fgCtx.stroke();
+  }
+
+  // -- Directional arrowheads along path segments --
+  for(let s=0;s<N_STEPS;s++){
+    const active=s<curF;
+    // During forward auto phase, skip inactive chevrons (no dim path to attach to)
+    if(isForwardAuto&&!active)continue;
+    const[px0,py0]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    const[px1,py1]=d2p(odePath[s+1].pos[0],odePath[s+1].pos[1]);
+    const mx=(px0+px1)/2, my=(py0+py1)/2;
+    const sdx=px1-px0, sdy=py1-py0;
+    const slen=Math.sqrt(sdx*sdx+sdy*sdy);
+    if(slen<2)continue;
+    const sa=Math.atan2(sdy,sdx);
+    const col=active?rgba(STYLE.pathRGB, STYLE.chevronActiveAlpha):rgba(STYLE.greyRGB, STYLE.chevronInactiveAlpha);
+    const sz=STYLE.chevronSize;
+    const ha=STYLE.chevronHalf;
+    fgCtx.fillStyle=col;
+    fgCtx.beginPath();
+    fgCtx.moveTo(mx+Math.cos(sa)*sz, my+Math.sin(sa)*sz);
+    fgCtx.lineTo(mx-sz*Math.cos(sa-ha), my-sz*Math.sin(sa-ha));
+    fgCtx.lineTo(mx-sz*Math.cos(sa+ha), my-sz*Math.sin(sa+ha));
+    fgCtx.closePath();fgCtx.fill();
+  }
+  // Start and end dots
+  for(const s of[0,N_STEPS]){
+    const[px,py]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+    const active=s<=curF;
+    fgCtx.fillStyle=STYLE.bg;
+    fgCtx.beginPath();fgCtx.arc(px,py,STYLE.dotOuterR,0,6.2832);fgCtx.fill();
+    fgCtx.fillStyle=active?rgba(STYLE.pathRGB,0.5):rgba(STYLE.greyRGB,0.25);
+    fgCtx.beginPath();fgCtx.arc(px,py,STYLE.dotInnerR,0,6.2832);fgCtx.fill();
+  }
+
+  // -- Current position indicator (interpolated, terracotta) --
+  {
+    const[cpx,cpy]=d2p(curPos[0],curPos[1]);
+    fgCtx.fillStyle=STYLE.bg;
+    fgCtx.beginPath();fgCtx.arc(cpx,cpy,STYLE.cursorOuterR,0,6.2832);fgCtx.fill();
+    fgCtx.fillStyle=STYLE.pathHex;
+    fgCtx.beginPath();fgCtx.arc(cpx,cpy,STYLE.cursorInnerR,0,6.2832);fgCtx.fill();
+    fgCtx.strokeStyle=STYLE.pathHex;fgCtx.lineWidth=STYLE.cursorRingW;
+    fgCtx.beginPath();fgCtx.arc(cpx,cpy,STYLE.cursorOuterR,0,6.2832);fgCtx.stroke();
+  }
+
+  // -- x0 handle (dashed circle, terracotta) --
+  {
+    const[px,py]=d2p(x0[0],x0[1]);
+    fgCtx.strokeStyle=rgba(STYLE.pathRGB,0.45);fgCtx.lineWidth=1.5;fgCtx.setLineDash([4,4]);
+    fgCtx.beginPath();fgCtx.arc(px,py,STYLE.x0HandleR,0,6.2832);fgCtx.stroke();fgCtx.setLineDash([]);
+    fgCtx.fillStyle=STYLE.pathHex;fgCtx.font='bold 10px Arial';fgCtx.textAlign='center';fgCtx.textBaseline='bottom';
+    fgCtx.fillText('x\u2080',px,py-15);
+  }
+
+  // -- Labels for start/end --
+  {
+    const[sx,sy]=d2p(odePath[0].pos[0],odePath[0].pos[1]);
+    fgCtx.font='bold 11px Arial';
+    fgCtx.fillStyle=rgba(STYLE.navyRGB,0.6);
+    fgCtx.textAlign='center';fgCtx.textBaseline='bottom';
+    fgCtx.fillText('t\u2080 (noise)',sx,sy-16);
+
+    const[ex,ey]=d2p(odePath[N_STEPS].pos[0],odePath[N_STEPS].pos[1]);
+    fgCtx.fillStyle=rgba(STYLE.navyRGB,0.6);
+    fgCtx.textAlign='center';fgCtx.textBaseline='top';
+    fgCtx.fillText('t\u2081 (data)',ex,ey+16);
+  }
+
+  const[cpx,cpy]=d2p(curPos[0],curPos[1]);
+
+  // -- Gradient arrows --
+  // Skip all gradient arrows while user is actively dragging x0
+  // During forward phase (auto): NO arrows at all
+  // During backward phase (auto): smooth wave grows arrows from data to noise
+  // During hold phase (auto): all arrows visible at full size
+  // During fade phase (auto): all arrows fade out simultaneously
+  // Manual mode (not autoPlaying): show all arrows as before
+  const curJ=lerpJac(curF), curJT=m2T(curJ);
+  const eG=m2v(curJT,gDir);
+  const eDir=vn(eG);
+  const aDeg=aVec(eG,gDir)*180/Math.PI;
+  const isAtEnd=(curF>=N_STEPS-0.01);
+
+  if(isDraggingX0){
+    // Dragging x0: no gradient arrows at all — just the path preview
+  } else if(isForwardAuto){
+    // Forward phase: no gradient arrows rendered
+  } else if((inBackward||inHold||inFade)&&autoPlaying){
+    // Backward wave / hold / fade phases
+    // During backward: wave front sweeps from N_STEPS to 0; arrows grow as front passes
+    // During hold: all arrows fully visible at full size
+    // During fade: all arrows fade out simultaneously
+    const globalFade=(inFade)?fadeAlpha:1;
+
+    for(let s=0;s<=N_STEPS;s++){
+      const[ppx,ppy]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+      const pJ=odeJacs[s], pJT=m2T(pJ);
+      const pG=m2v(pJT,gDir);
+      const pDir=vn(pG);
+      const pDeg=aVec(pG,gDir)*180/Math.PI;
+      const col=s===N_STEPS?STYLE.burgundy:aC(pDeg);
+
+      // Compute growth factor for this arrow
+      let growFactor;
+      if(inHold||inFade){
+        // All arrows fully grown
+        growFactor=1;
+      } else {
+        // Backward phase: wave front is at backpropPos (sweeping from N_STEPS down to 0)
+        // The wave starts at the DATA end (high s) and sweeps toward NOISE (low s).
+        // Arrows at step s:
+        //   s < backpropPos - waveFrontWidth/2 : wave hasn't reached here yet -> invisible
+        //   s > backpropPos + waveFrontWidth/2 : wave already passed -> fully grown
+        //   in between: smoothly growing
+        const waveFront=backpropPos;
+        const halfW=STYLE.waveFrontWidth/2;
+        if(s<waveFront-halfW){
+          continue; // wave hasn't reached this step yet
+        } else if(s>=waveFront+halfW){
+          growFactor=1; // wave already passed — fully grown
+        } else {
+          // In the transition zone: interpolate
+          // s near (waveFront+halfW) = just passed -> nearly full
+          // s near (waveFront-halfW) = just being reached -> nearly zero
+          const t=(s-(waveFront-halfW))/STYLE.waveFrontWidth; // 0 at leading edge (just reached), 1 at trailing (fully passed)
+          growFactor=t*t*(3-2*t); // smoothstep
+          if(growFactor<0.02) continue; // too small to render
+        }
+      }
+
+      const curLen=arrowLen*growFactor;
+      const tx=odePath[s].pos[0]+pDir[0]*curLen;
+      const ty=odePath[s].pos[1]+pDir[1]*curLen;
+      const[tpx,tpy]=d2p(tx,ty);
+
+      const alpha=STYLE.trailAlphaFloor*growFactor*globalFade;
+      const lw=STYLE.trailW*Math.max(growFactor,0.3);
+      const hs=STYLE.trailHead*Math.max(growFactor,0.3);
+
+      fgCtx.globalAlpha=alpha;
+      if(growFactor>0.3){
+        arrow(ppx,ppy,tpx,tpy,col,lw,hs);
+      } else {
+        // Too small for arrowhead — shaft only
+        fgCtx.strokeStyle=col;fgCtx.lineWidth=lw;fgCtx.lineCap='round';
+        fgCtx.beginPath();fgCtx.moveTo(ppx,ppy);fgCtx.lineTo(tpx,tpy);fgCtx.stroke();
+      }
+      fgCtx.globalAlpha=1;
+    }
+  } else if(!autoPlaying){
+    // Manual mode: show all trail arrows + hero at current position
+    for(let s=0;s<=N_STEPS;s++){
+      if(Math.abs(s-curF)<0.5) continue;
+
+      const[ppx,ppy]=d2p(odePath[s].pos[0],odePath[s].pos[1]);
+      const pJ=odeJacs[s], pJT=m2T(pJ);
+      const pG=m2v(pJT,gDir);
+      const pDir=vn(pG);
+      const pDeg=aVec(pG,gDir)*180/Math.PI;
+      const dLen=arrowLen;
+
+      const dist=Math.abs(s-curF);
+      const baseAlpha=Math.max(STYLE.trailAlphaFloor, STYLE.trailAlpha-dist*STYLE.trailAlphaFade);
+
+      const tx=odePath[s].pos[0]+pDir[0]*dLen, ty=odePath[s].pos[1]+pDir[1]*dLen;
+      const[tpx,tpy]=d2p(tx,ty);
+      fgCtx.globalAlpha=baseAlpha;
+      arrow(ppx,ppy,tpx,tpy,s===N_STEPS?STYLE.burgundy:aC(pDeg),STYLE.trailW,STYLE.trailHead);
+      fgCtx.globalAlpha=1;
+    }
+
+    // Current step: hero arrow
+    const bigLen=arrowLen*STYLE.heroScale;
+    const tx=curPos[0]+eDir[0]*bigLen;
+    const ty=curPos[1]+eDir[1]*bigLen;
+    const[tpx,tpy]=d2p(tx,ty);
+    const col=isAtEnd?STYLE.burgundy:aC(aDeg);
+    fgCtx.globalAlpha=0.5;
+    arrow(cpx,cpy,tpx,tpy,STYLE.bg,STYLE.heroShadowW,STYLE.heroShadowHead);
+    fgCtx.globalAlpha=1;
+    arrow(cpx,cpy,tpx,tpy,col,STYLE.heroW,STYLE.heroHead);
+  }
+
+  // -- Gradient direction legend (top-right, draggable) --
+  drawGradLegend(fgCtx);
+
+  fgCtx.restore();
+}
+
+// ================================================================
+// Gradient direction legend widget (top-right corner)
+// ================================================================
+function legendCenter(){
+  return[W-STYLE.legendMargin-STYLE.legendR, STYLE.legendMargin+STYLE.legendR];
+}
+
+function drawGradLegend(ctx){
+  const[cx,cy]=legendCenter();
+
+  // Outer circle
+  ctx.fillStyle=rgba(STYLE.bgRGB,0.85);
+  ctx.strokeStyle=rgba(STYLE.navyRGB,0.25);
+  ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.arc(cx,cy,STYLE.legendR,0,Math.PI*2);ctx.fill();ctx.stroke();
+
+  // Subtle tick marks at 0/90/180/270
+  ctx.strokeStyle=rgba(STYLE.navyRGB,0.1);ctx.lineWidth=1;
+  for(let i=0;i<4;i++){
+    const a=i*Math.PI/2;
+    ctx.beginPath();
+    ctx.moveTo(cx+Math.cos(a)*(STYLE.legendR-6), cy+Math.sin(a)*(STYLE.legendR-6));
+    ctx.lineTo(cx+Math.cos(a)*(STYLE.legendR-2), cy+Math.sin(a)*(STYLE.legendR-2));
+    ctx.stroke();
+  }
+
+  // Gradient arrow — screen-space angle
+  const sA=-gradAngle;
+  const ax=Math.cos(sA)*STYLE.legendArrow, ay=Math.sin(sA)*STYLE.legendArrow;
+  const tipX=cx+ax, tipY=cy+ay;
+
+  // Arrow shaft
+  const hs=STYLE.legendHeadSize;
+  const aa=Math.atan2(ay,ax);
+  const shaftEndX=tipX-hs*0.6*Math.cos(aa), shaftEndY=tipY-hs*0.6*Math.sin(aa);
+  ctx.strokeStyle=STYLE.burgundy;ctx.lineWidth=STYLE.legendShaftW;ctx.lineCap='round';
+  ctx.beginPath();ctx.moveTo(cx-ax*0.3,cy-ay*0.3);ctx.lineTo(shaftEndX,shaftEndY);ctx.stroke();
+
+  // Arrowhead
+  const ha=STYLE.legendHeadHalf;
+  ctx.fillStyle=STYLE.burgundy;
+  ctx.beginPath();ctx.moveTo(tipX,tipY);
+  ctx.lineTo(tipX-hs*Math.cos(aa-ha),tipY-hs*Math.sin(aa-ha));
+  ctx.lineTo(tipX-hs*Math.cos(aa+ha),tipY-hs*Math.sin(aa+ha));
+  ctx.closePath();ctx.fill();
+
+  // Label
+  ctx.fillStyle=STYLE.burgundy;ctx.font='bold 11px Arial';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('Reward Gradient',cx,cy+STYLE.legendR+12);
+
+  // Drag hint — subtle ring
+  ctx.strokeStyle=rgba(STYLE.angleBadRGB,0.12);ctx.lineWidth=1;ctx.setLineDash([3,3]);
+  ctx.beginPath();ctx.arc(cx,cy,STYLE.legendR+4,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);
+}
+
+function hitLegend(mx,my){
+  const[cx,cy]=legendCenter();
+  return Math.sqrt((mx-cx)**2+(my-cy)**2)<STYLE.legendR+STYLE.legendHitPad;
+}
+
+// ================================================================
+// Auto-animation loop
+// ================================================================
+function startAnimation(){
+  restartForwardAnimation();
+}
+
+function resumeAuto(){
+  startAnimation();
+}
+
+function animationTick(now){
+  requestAnimationFrame(animationTick);
+
+  // Check for auto-resume after idle
+  if(!autoPlaying&&lastInteractionTime>0){
+    if(now-lastInteractionTime>AUTO_RESUME_DELAY){
+      lastInteractionTime=0;
+      startAnimation();
+    }
+  }
+
+  if(!autoPlaying){
+    render();
+    return;
+  }
+
+  const elapsed=(now-animStartTime)/1000;
+
+  if(animPhase==='forward'){
+    // Forward sampling: viewStepF goes from 0 to N_STEPS
+    const progress=Math.min(1, elapsed/STYLE.forwardDuration);
+    // Use ease-in-out for smoother motion
+    const eased=progress<0.5?2*progress*progress:1-Math.pow(-2*progress+2,2)/2;
+    viewStepF=eased*N_STEPS;
+    syncSlider();
+
+    if(progress>=1){
+      // Transition to backward phase
+      viewStepF=N_STEPS;
+      animPhase='backward';
+      animStartTime=now;
+      backpropPos=N_STEPS+STYLE.waveFrontWidth/2; // start with wave front just above N_STEPS
+    }
+  } else if(animPhase==='backward'){
+    // Backward gradient transport: smooth continuous wave
+    // backpropPos sweeps from N_STEPS down past 0 so the last arrows fully grow
+    const startPos=N_STEPS+STYLE.waveFrontWidth/2;
+    const endPos=-STYLE.waveFrontWidth/2; // sweep past 0 so all arrows finish growing
+    const progress=Math.min(1, elapsed/STYLE.backwardDuration);
+    // Use ease-in-out for smooth start/stop
+    const eased=progress<0.5?2*progress*progress:1-Math.pow(-2*progress+2,2)/2;
+    backpropPos=startPos+(endPos-startPos)*eased;
+
+    // Keep viewStepF at N_STEPS during backward (path stays fully drawn)
+    viewStepF=N_STEPS;
+    syncSlider();
+
+    if(progress>=1){
+      // Wave has fully passed — all arrows are grown. Transition to hold.
+      backpropPos=endPos;
+      animPhase='hold';
+      animStartTime=now;
+      fadeAlpha=1;
+    }
+  } else if(animPhase==='hold'){
+    // Brief pause with all arrows visible at full size
+    if(elapsed>=STYLE.holdDuration){
+      animPhase='fade';
+      animStartTime=now;
+      fadeAlpha=1;
+    }
+  } else if(animPhase==='fade'){
+    // All arrows fade out simultaneously
+    const progress=Math.min(1, elapsed/STYLE.fadeDuration);
+    // Use ease-out for a natural fade
+    fadeAlpha=1-progress*progress;
+
+    if(progress>=1){
+      fadeAlpha=0;
+      animPhase='pause';
+      animStartTime=now;
+    }
+  } else if(animPhase==='pause'){
+    if(elapsed>=STYLE.pauseDuration){
+      // Loop back to forward phase
+      animPhase='forward';
+      animStartTime=now;
+      viewStepF=0;
+      backpropPos=N_STEPS+STYLE.waveFrontWidth/2;
+      fadeAlpha=1;
+    }
+  }
+
+  render();
+}
+
+// ================================================================
+// Interaction (with rAF throttling for smooth dragging)
+// ================================================================
+let rafPending=false;
+function cXY(e){
+  const r=fgCanvas.getBoundingClientRect();
+  const cx=(e.touches?e.touches[0].clientX:e.clientX);
+  const cy=(e.touches?e.touches[0].clientY:e.clientY);
+  return[(cx-r.left)*W/r.width,(cy-r.top)*H/r.height];
+}
+function restartForwardAnimation(){
+  autoPlaying=true;
+  animPhase='forward';
+  animStartTime=performance.now();
+  viewStepF=0;
+  backpropPos=N_STEPS+STYLE.waveFrontWidth/2;
+  fadeAlpha=1;
+  document.getElementById('resumeLink').style.display='none';
+  syncSlider();
+}
+function pauseAutoForInteraction(){
+  autoPlaying=false;
+  lastInteractionTime=performance.now();
+  document.getElementById('resumeLink').style.display='inline';
+}
+function showFullPathImmediate(){
+  // During active x0 drag: show the full path with no arrows, no animation
+  autoPlaying=false;
+  animPhase='forward'; // doesn't matter much — isDraggingX0 suppresses arrows
+  viewStepF=N_STEPS;
+  backpropPos=N_STEPS+STYLE.waveFrontWidth/2;
+  fadeAlpha=1;
+  // Suppress auto-resume timer during drag
+  lastInteractionTime=0;
+  document.getElementById('resumeLink').style.display='none';
+  syncSlider();
+}
+function onDown(e){
+  const[mx,my]=cXY(e);
+  if(hitLegend(mx,my)){
+    e.preventDefault();isDrag=true;dragTarget='grad';
+    // Do NOT pause; keep animation running (grad drag doesn't restart)
+    onMove(e);return;
+  }
+  e.preventDefault();isDrag=true;dragTarget='x0';isDraggingX0=true;
+  const[dx,dy]=p2d(mx,my);
+  x0=[dx,dy];
+  integrateODE();
+  // During drag: show full path immediately (no progressive animation, no arrows)
+  showFullPathImmediate();
+  render();
+}
+function onMove(e){
+  if(!isDrag)return;e.preventDefault();
+  const[mx,my]=cXY(e);
+  if(rafPending)return;
+  rafPending=true;
+  requestAnimationFrame(()=>{
+    rafPending=false;
+    if(!isDrag)return;
+    if(dragTarget==='grad'){
+      const[lcx,lcy]=legendCenter();
+      const ddx=mx-lcx,ddy=my-lcy;
+      if(Math.abs(ddx)>2||Math.abs(ddy)>2)gradAngle=Math.atan2(-ddy,ddx);
+      render();
+    } else {
+      const[ddx,ddy]=p2d(mx,my);
+      x0=[ddx,ddy];
+      integrateODE();
+      // During drag: show full path immediately (no progressive animation)
+      showFullPathImmediate();
+      render();
+    }
+  });
+}
+function onUp(){
+  if(isDrag&&dragTarget==='x0'){
+    // User released after dragging x0 — clear drag flag, start forward animation
+    isDrag=false;dragTarget=null;isDraggingX0=false;
+    restartForwardAnimation();
+    return;
+  }
+  isDrag=false;dragTarget=null;
+}
+
+// ================================================================
+// Controls
+// ================================================================
+function stepFToT(f){
+  // Map continuous slider position [0, N_STEPS] to ODE timestep [0, 1]
+  const tS=0.01, tE=0.995;
+  return tS+(f/N_STEPS)*(tE-tS);
+}
+function syncSlider(){
+  const slider=document.getElementById('stepSlider');
+  slider.value=Math.round(viewStepF/N_STEPS*SLIDER_RES);
+  document.getElementById('stepVal').textContent=stepFToT(viewStepF).toFixed(2);
+}
+
+// ================================================================
+// Init
+// ================================================================
+function initFg(){
+  fgCanvas=document.getElementById('fg');
+  fgCtx=fgCanvas.getContext('2d');
+  dpr=window.devicePixelRatio||1;
+  const box=document.getElementById('box');
+  const r=box.getBoundingClientRect();
+  W=r.width;H=r.height;
+  fgCanvas.width=W*dpr;fgCanvas.height=H*dpr;
+  fgCanvas.style.width=W+'px';fgCanvas.style.height=H+'px';
+}
+
+function setup(){
+  renderVectorTree();
+  document.getElementById('loadMsg').style.display='none';
+
+  initFg();
+  integrateODE();
+
+  // Set initial timestep label
+  document.getElementById('stepVal').textContent='0.01';
+
+  render();
+
+  fgCanvas.addEventListener('mousedown',onDown);
+  document.addEventListener('mousemove',onMove);
+  document.addEventListener('mouseup',onUp);
+  fgCanvas.addEventListener('touchstart',onDown,{passive:false});
+  document.addEventListener('touchmove',onMove,{passive:false});
+  document.addEventListener('touchend',onUp);
+
+  document.getElementById('stepSlider').addEventListener('input',function(e){
+    viewStepF=parseInt(e.target.value)/SLIDER_RES*N_STEPS;
+    document.getElementById('stepVal').textContent=stepFToT(viewStepF).toFixed(2);
+    // Pause auto-animation when user manually scrubs
+    pauseAutoForInteraction();
+    render();
+  });
+
+  let rt;
+  window.addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{renderVectorTree();initFg();render();},200);});
+
+  // Start the auto-animation loop
+  startAnimation();
+  requestAnimationFrame(animationTick);
+}
+
+requestAnimationFrame(()=>setTimeout(setup,50));
+</script>
+</body>
+</html>

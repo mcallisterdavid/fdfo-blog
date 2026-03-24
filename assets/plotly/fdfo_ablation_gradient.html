@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gradient Approach Ablation: Convergence Comparison</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+  html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: #fff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    color: #050532;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 14px 12px 8px;
+  }
+  h2 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #050532;
+    margin-bottom: 2px;
+    text-align: center;
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    font-size: 0.78rem;
+    color: #656C75;
+    margin-bottom: 10px;
+    text-align: center;
+  }
+  .chart-container {
+    width: 100%;
+    max-width: 720px;
+    flex: 1;
+    min-height: 0;
+  }
+  .caption {
+    font-size: 0.72rem;
+    color: #656C75;
+    max-width: 780px;
+    text-align: center;
+    margin-top: 6px;
+    line-height: 1.4;
+  }
+  @media (max-width: 640px) {
+    body { padding: 8px 6px 4px; }
+    h2 { font-size: 0.95rem; }
+    .subtitle { font-size: 0.7rem; margin-bottom: 6px; }
+    .chart-container { min-height: 200px; }
+    .caption { font-size: 0.65rem; margin-top: 4px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- <h2>Gradient Backpropagation Ablation</h2>
+<p class="subtitle">Comparing copy gradient and backprop through the sampling chain on OneIG alignment.</p> -->
+
+<div class="chart-container" id="chart"></div>
+
+<p class="caption">We find that copying the gradient from the final step and applying it uniformly to all steps outperforms backpropagating that gradient through the sampling trajectory on OneIG alignment.</p>
+
+<script>
+(function() {
+  var NAVY = '#050532';
+  var TERRACOTTA = '#AB8064';
+  var BURGUNDY = '#732424';
+  var CREAM = '#FAF8F5';
+  var SLATE = '#656C75';
+
+  // Epoch axis: 0, 5, 10, ..., 400 (81 values)
+  var epochs = [];
+  for (var i = 0; i <= 80; i++) epochs.push(i * 5);
+
+  // OneIG Alignment (×100) — first 81 values (epochs 0–400)
+  var comboI = [59.83,63.14,65.43,67.24,68.51,69.74,70.74,71.61,72.51,73.18,73.68,74.17,74.77,75.32,75.72,76.22,76.82,77.24,77.55,77.88,78.24,78.47,78.53,78.76,79.10,79.35,79.49,79.67,79.90,80.06,80.27,80.48,80.64,80.88,81.04,81.01,81.02,81.21,81.37,81.39,81.47,81.60,81.70,81.66,81.55,81.64,81.78,81.86,81.90,82.00,82.15,82.18,82.17,82.20,82.26,82.28,82.30,82.36,82.35,82.37,82.59,82.73,82.65,82.51,82.47,82.54,82.62,82.70,82.79,82.82,82.73,82.74,82.94,83.01,82.96,82.94,82.89,82.90,82.96,82.95,82.97];
+
+  var comboJ = [60.15,61.03,61.39,61.96,62.72,63.38,63.79,64.00,64.47,65.41,66.14,66.44,66.46,66.23,66.24,66.67,67.08,67.14,67.27,67.55,67.62,67.56,67.32,67.00,66.90,66.98,67.09,67.26,67.52,67.57,67.16,66.64,66.34,66.25,66.38,66.45,66.35,66.31,66.30,66.40,66.69,67.01,67.03,66.90,67.12,67.36,67.32,67.38,67.58,67.82,68.17,68.25,68.02,67.84,67.73,67.86,68.17,68.25,68.26,68.36,68.39,68.43,68.51,68.58,68.66,68.62,68.54,68.66,68.78,68.51,68.20,68.28,68.22,67.55,66.88,66.61,66.40,66.24,66.14,66.08,65.96];
+
+  // Shared layout config
+  var fontFamily = 'Arial, Helvetica, sans-serif';
+
+  var layout = {
+    // title: {
+    //   text: 'OneIG Alignment',
+    //   font: { family: fontFamily, size: 14, color: NAVY, weight: 600 },
+    //   x: 0.5,
+    //   xanchor: 'center',
+    //   y: 0.97,
+    //   yanchor: 'top',
+    //   pad: { t: 0, b: 0 }
+    // },
+    xaxis: {
+      title: { text: 'Epoch', font: { family: fontFamily, size: 12, color: SLATE }, standoff: 6 },
+      range: [0, 400],
+      tickfont: { family: fontFamily, size: 10, color: SLATE },
+      gridcolor: 'rgba(5,5,50,0.08)',
+      gridwidth: 1,
+      linecolor: 'rgba(5,5,50,0.2)',
+      linewidth: 1,
+      zeroline: false,
+      dtick: 100,
+      ticks: 'outside',
+      ticklen: 4,
+      tickcolor: 'rgba(5,5,50,0.2)'
+    },
+    yaxis: {
+      title: { text: 'OneIG Alignment', font: { family: fontFamily, size: 12, color: SLATE }, standoff: 6 },
+      range: [55, 85],
+      tickfont: { family: fontFamily, size: 10, color: SLATE },
+      gridcolor: 'rgba(5,5,50,0.08)',
+      gridwidth: 1,
+      linecolor: 'rgba(5,5,50,0.2)',
+      linewidth: 1,
+      zeroline: false,
+      ticks: 'outside',
+      ticklen: 4,
+      tickcolor: 'rgba(5,5,50,0.2)'
+    },
+    plot_bgcolor: CREAM,
+    paper_bgcolor: '#fff',
+    margin: { l: 52, r: 14, t: 32, b: 42 },
+    showlegend: true,
+    legend: {
+      x: 0.98,
+      y: 0.02,
+      xanchor: 'right',
+      yanchor: 'bottom',
+      bgcolor: 'rgba(255,255,255,0.92)',
+      bordercolor: 'rgba(5,5,50,0.12)',
+      borderwidth: 1,
+      font: { family: fontFamily, size: 10, color: NAVY },
+      tracegroupgap: 2,
+      itemwidth: 30
+    },
+    hovermode: 'x unified',
+    hoverlabel: {
+      bgcolor: '#fff',
+      bordercolor: 'rgba(5,5,50,0.15)',
+      font: { family: fontFamily, size: 11, color: NAVY }
+    }
+  };
+
+  function makeTrace(x, y, name, color, dash, width) {
+    return {
+      x: x,
+      y: y,
+      name: name,
+      type: 'scatter',
+      mode: 'lines',
+      line: {
+        color: color,
+        width: width || 2,
+        dash: dash || 'solid',
+        shape: 'spline',
+        smoothing: 0.8
+      },
+      hovertemplate: name + ': %{y:.4f}<extra></extra>'
+    };
+  }
+
+  var traces = [
+    makeTrace(epochs, comboI, 'Copy gradient', TERRACOTTA, 'solid', 2),
+    makeTrace(epochs, comboJ, 'Backprop through chain', BURGUNDY, 'solid', 2)
+  ];
+
+  var config = {
+    responsive: true,
+    displayModeBar: false,
+    scrollZoom: false
+  };
+
+  Plotly.newPlot('chart', traces, layout, config);
+
+  // Responsive resize
+  window.addEventListener('resize', function() {
+    Plotly.Plots.resize('chart');
+  });
+})();
+</script>
+
+</body>
+</html>

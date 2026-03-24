@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FDFO Approach to Flow RL</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden;
+            font-family: Arial, Helvetica, sans-serif;
+            background-color: #fff;
+            color: #050532;
+        }
+
+        .outer-wrapper {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            box-sizing: border-box;
+        }
+
+        .title-block {
+            text-align: center;
+            padding: 8px 16px 4px 16px;
+            flex-shrink: 0;
+        }
+
+        .title-block h2 {
+            margin: 0 0 1px 0;
+            font-size: 17px;
+            font-weight: 700;
+            color: #050532;
+            letter-spacing: -0.3px;
+        }
+
+        .title-block .subtitle {
+            margin: 0;
+            font-size: 11.5px;
+            color: #656C75;
+            line-height: 1.3;
+        }
+
+        .heatmap-wrapper {
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            border-radius: 0;
+            position: relative;
+            background-color: #fff;
+        }
+
+        #visualization-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+        }
+
+        #plot-container {
+            width: 100%;
+            height: 100%;
+            background-color: #fff;
+        }
+
+        #particle-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+
+        @media (max-width: 768px) {
+            .title-block h2 { font-size: 14px; }
+            .title-block .subtitle { font-size: 10px; }
+        }
+    </style>
+</head>
+<body>
+<div class="outer-wrapper">
+    <div class="title-block">
+        <h2>FDFO Approach to Flow RL</h2>
+        <p class="subtitle">Paired trajectories from shared noise estimate a reward gradient direction</p>
+    </div>
+
+    <div class="heatmap-wrapper">
+        <div id="visualization-container">
+            <div id="plot-container"></div>
+            <canvas id="particle-canvas"></canvas>
+        </div>
+    </div>
+</div>
+
+<script>
+// ===== PALETTE =====
+const C = {
+    navy:       '#050532',
+    burgundy:   '#732424',
+    grey:       '#656C75',
+    terracotta: '#AB8064',
+    cream:      '#FAF8F5',
+    creamDark:  '#f0ebe3',
+    teal:       '#1A7A6D',
+};
+
+const isMobile = window.innerWidth <= 768;
+
+// ===== FLOW PARAMETERS =====
+const xMin = -1.7, xMax = 1.7;
+const nPoints = 300;
+const nTimeSteps = 200;
+const priorStd = 0.6;
+
+const dataModes = [
+    { mean: -0.7, std: 0.3, weight: 0.6 },
+    { mean:  0.7, std: 0.3, weight: 0.4 }
+];
+
+const xMinExt = -1.7, xMaxExt = 1.7;
+const nPointsExt = 500;
+
+// ODE integration
+const N_ODE_STEPS = 80;
+const odeDt = 1.0 / N_ODE_STEPS;
+
+// Continuous small stochasticity at every step
+const NOISE_SCALE = 0.3; // magnitude: NOISE_SCALE * sqrt(dt) * (1-t)
+
+// Animation timing (seconds)
+const PHASE_FLOW    = 4.0;
+const PHASE_REWARD  = 1.0;
+const PHASE_UPDATE  = 2.0;
+const PHASE_HOLD    = 2.0;
+const TOTAL_DURATION = PHASE_FLOW + PHASE_REWARD + PHASE_UPDATE + PHASE_HOLD;
+
+// ===== GRIDS =====
+const xGrid = [];
+for (let i = 0; i < nPoints; i++) xGrid.push(xMin + (xMax - xMin) * i / (nPoints - 1));
+
+const xGridExt = [];
+for (let i = 0; i < nPointsExt; i++) xGridExt.push(xMinExt + (xMaxExt - xMinExt) * i / (nPointsExt - 1));
+
+const tGrid = [];
+for (let i = 0; i < nTimeSteps; i++) tGrid.push(i / (nTimeSteps - 1));
+
+// ===== MATH =====
+function gaussianPDF(x, mean, std) {
+    const v = std * std;
+    return Math.exp(-0.5 * (x - mean) * (x - mean) / v) / Math.sqrt(2 * Math.PI * v);
+}
+
+function priorPDF(x) { return gaussianPDF(x, 0, priorStd); }
+
+function flowPDF(x, t) {
+    let p = 0;
+    for (const m of dataModes) {
+        const mu = t * m.mean;
+        const sig = Math.sqrt(t * t * m.std * m.std + (1 - t) * (1 - t) * priorStd * priorStd);
+        p += m.weight * gaussianPDF(x, mu, sig);
+    }
+    return p;
+}
+
+function posteriorMean(x, t) {
+    if (t < 1e-6) return 0;
+    if (t > 1 - 1e-6) return x;
+    const noiseVar = (1 - t) * (1 - t) * priorStd * priorStd;
+    let num = 0, den = 0;
+    for (const m of dataModes) {
+        const pv = m.std * m.std;
+        const postPrec = 1 / pv + t * t / noiseVar;
+        const postVar = 1 / postPrec;
+        const postMu = postVar * (m.mean / pv + t * x / noiseVar);
+        const margMu = t * m.mean;
+        const margVar = t * t * pv + noiseVar;
+        const lik = m.weight * gaussianPDF(x, margMu, Math.sqrt(margVar));
+        num += lik * postMu;
+        den += lik;
+    }
+    return den > 0 ? num / den : x;
+}
+
+function velocity(x, t) {
+    if (t > 1 - 1e-6) return 0;
+    return (posteriorMean(x, t) - x) / (1 - t);
+}
+
+function randn() {
+    return Math.sqrt(-2 * Math.log(Math.random())) * Math.cos(2 * Math.PI * Math.random());
+}
+
+function reward(xFinal) {
+    return (xFinal - xMin) / (xMax - xMin);
+}
+
+// ===== PAIRED TRAJECTORIES =====
+// Both trajectories start at the same x0.
+// At each ODE step, a shared random sample is drawn. Trajectory A gets +noise,
+// trajectory B gets -noise. This produces smooth, gradually diverging paths.
+let pairData = null;
+
+function generateTrajectory() {
+    const x0 = randn() * priorStd;
+    const clampedX0 = Math.max(xMin + 0.15, Math.min(xMax - 0.15, x0));
+
+    const ptsA = [{ t: 0, x: clampedX0 }];
+    const ptsB = [{ t: 0, x: clampedX0 }];
+    let xA = clampedX0, xB = clampedX0;
+
+    for (let step = 0; step < N_ODE_STEPS; step++) {
+        const t = step * odeDt;
+
+        // Shared noise sample; A gets +, B gets -
+        const noise = randn() * NOISE_SCALE * Math.sqrt(odeDt) * Math.max(0.05, 1 - t);
+
+        // Trajectory A: deterministic flow + noise
+        const vA = velocity(xA, t);
+        xA += vA * odeDt + noise;
+        xA = Math.max(xMin + 0.1, Math.min(xMax - 0.1, xA));
+        ptsA.push({ t: (step + 1) * odeDt, x: xA });
+
+        // Trajectory B: deterministic flow - noise
+        const vB = velocity(xB, t);
+        xB += vB * odeDt - noise;
+        xB = Math.max(xMin + 0.1, Math.min(xMax - 0.1, xB));
+        ptsB.push({ t: (step + 1) * odeDt, x: xB });
+    }
+
+    const rewardA = reward(xA);
+    const rewardB = reward(xB);
+
+    let hi, lo, hiReward, loReward;
+    if (rewardA >= rewardB) {
+        hi = { pts: ptsA, xFinal: xA };
+        lo = { pts: ptsB, xFinal: xB };
+        hiReward = rewardA; loReward = rewardB;
+    } else {
+        hi = { pts: ptsB, xFinal: xB };
+        lo = { pts: ptsA, xFinal: xA };
+        hiReward = rewardB; loReward = rewardA;
+    }
+
+    pairData = {
+        x0: clampedX0,
+        hi: hi,
+        lo: lo,
+        hiReward: hiReward,
+        loReward: loReward,
+    };
+}
+
+// ===== HEATMAP =====
+function createDensityMatrix() {
+    const z = [];
+    for (let i = 0; i < nPoints; i++) {
+        const row = [];
+        for (let j = 0; j < nTimeSteps; j++) row.push(flowPDF(xGrid[i], tGrid[j]));
+        z.push(row);
+    }
+    return z;
+}
+
+// Colorscale: navy (low) -> warm cream (high)
+const invertedColorscale = [
+    [0,    '#050532'],
+    [0.15, '#1a1540'],
+    [0.3,  '#3d2a40'],
+    [0.45, '#6b4a3a'],
+    [0.6,  '#AB8064'],
+    [0.75, '#c4a080'],
+    [0.85, '#d4b898'],
+    [0.93, '#e0cdb0'],
+    [1.0,  '#e8d8c0']
+];
+
+// ===== PLOTLY SETUP =====
+function plotFlow() {
+    const densityMatrix = createDensityMatrix();
+    const scale = 0.15;
+
+    const heatmapTrace = {
+        x: tGrid,
+        y: xGrid,
+        z: densityMatrix,
+        type: 'heatmap',
+        colorscale: invertedColorscale,
+        showscale: false,
+        hoverinfo: 'none',
+    };
+
+    const priorY = xGridExt.map(x => priorPDF(x));
+    const priorMax = Math.max(...priorY);
+
+    const priorTrace = {
+        x: priorY.map(y => -scale * 0.9 * y / priorMax),
+        y: xGridExt,
+        type: 'scatter',
+        mode: 'lines',
+        line: { width: 2.5, color: C.navy, dash: 'dash' },
+        fill: 'tozerox',
+        fillcolor: C.navy,
+        name: 'Prior',
+        xaxis: 'x2',
+        yaxis: 'y2',
+        hoverinfo: 'none'
+    };
+
+    let layout;
+
+    if (isMobile) {
+        layout = {
+            hovermode: false,
+            paper_bgcolor: '#fff',
+            plot_bgcolor: 'rgba(0,0,0,0)',
+            xaxis: {
+                title: { text: 'Timestep (t)', font: { size: 12, weight: 'bold', color: C.grey } },
+                domain: [0.25, 0.88],
+                range: [0, 1],
+                zeroline: false,
+                tickfont: { size: 9, color: C.grey },
+            },
+            yaxis: {
+                range: [xMin, xMax],
+                showticklabels: false,
+                ticks: '',
+                zeroline: false,
+            },
+            xaxis2: {
+                domain: [0, 0.2],
+                showticklabels: false,
+                showgrid: false,
+                zeroline: false,
+                range: [-scale, 0]
+            },
+            yaxis2: {
+                anchor: 'x2',
+                showticklabels: false,
+                zeroline: false,
+                showgrid: false,
+                range: [xMinExt, xMaxExt]
+            },
+            annotations: [
+                {
+                    text: 'Prior',
+                    x: 0.1, y: 1.05,
+                    xref: 'paper', yref: 'paper',
+                    showarrow: false,
+                    font: { size: 13, color: C.navy, weight: 'bold' }
+                }
+            ],
+            showlegend: false,
+            margin: { t: 15, l: 20, r: 40, b: 30 },
+            font: { size: 10 },
+        };
+    } else {
+        layout = {
+            hovermode: false,
+            paper_bgcolor: '#fff',
+            plot_bgcolor: 'rgba(0,0,0,0)',
+            xaxis: {
+                title: { text: 'Timestep (t)', font: { weight: 'bold', color: C.grey } },
+                domain: [0.2, 0.88],
+                range: [0, 1],
+                zeroline: false,
+                tickfont: { color: C.grey },
+            },
+            yaxis: {
+                range: [xMin, xMax],
+                showticklabels: false,
+                ticks: '',
+                zeroline: false,
+            },
+            xaxis2: {
+                domain: [0, 0.15],
+                showticklabels: false,
+                showgrid: false,
+                zeroline: false,
+                range: [-scale, 0]
+            },
+            yaxis2: {
+                anchor: 'x2',
+                showticklabels: false,
+                zeroline: false,
+                showgrid: false,
+                range: [xMinExt, xMaxExt]
+            },
+            annotations: [
+                {
+                    text: 'Prior',
+                    x: 0.075, y: 1.05,
+                    xref: 'paper', yref: 'paper',
+                    showarrow: false,
+                    font: { size: 18, color: C.navy, weight: 'bold' }
+                }
+            ],
+            showlegend: false,
+            margin: { t: 20, l: 40, r: 40, b: 40 },
+        };
+    }
+
+    const config = {
+        responsive: true,
+        displayModeBar: false,
+        staticPlot: true,
+        scrollZoom: false,
+    };
+
+    return Plotly.newPlot('plot-container', [heatmapTrace, priorTrace], layout, config);
+}
+
+// ===== CANVAS + COORDINATE MAPPING =====
+let canvas, ctx, canvasW, canvasH;
+let coordMap = null;
+
+function setupCanvas() {
+    canvas = document.getElementById('particle-canvas');
+    ctx = canvas.getContext('2d');
+    const plotDiv = document.getElementById('plot-container');
+    if (!plotDiv || !plotDiv._fullLayout) return;
+
+    const rect = plotDiv.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = rect.width + 'px';
+    canvas.style.height = rect.height + 'px';
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(dpr, dpr);
+    canvasW = rect.width;
+    canvasH = rect.height;
+
+    const lay = plotDiv._fullLayout;
+    const xa = lay.xaxis, ya = lay.yaxis;
+    coordMap = {
+        xMin: xa.range[0], xMax: xa.range[1],
+        yMin: ya.range[0], yMax: ya.range[1],
+        pL: xa._offset, pT: ya._offset,
+        pW: xa._length, pH: ya._length
+    };
+}
+
+function d2p(t, x) {
+    if (!coordMap) return { px: 0, py: 0 };
+    const px = coordMap.pL + (t - coordMap.xMin) / (coordMap.xMax - coordMap.xMin) * coordMap.pW;
+    const py = coordMap.pT + coordMap.pH - (x - coordMap.yMin) / (coordMap.yMax - coordMap.yMin) * coordMap.pH;
+    return { px, py };
+}
+
+// ===== DRAWING HELPERS =====
+
+function drawArrow(px1, py1, px2, py2, color, lineWidth, alpha, dashed) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+    if (dashed) ctx.setLineDash([5, 4]);
+
+    ctx.beginPath();
+    ctx.moveTo(px1, py1);
+    ctx.lineTo(px2, py2);
+    ctx.stroke();
+
+    if (dashed) ctx.setLineDash([]);
+
+    const dx = px2 - px1, dy = py2 - py1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len < 2) { ctx.restore(); return; }
+    const angle = Math.atan2(dy, dx);
+    const headLen = Math.min(10, len * 0.4);
+    const headAngle = 0.42;
+    ctx.beginPath();
+    ctx.moveTo(px2, py2);
+    ctx.lineTo(px2 - headLen * Math.cos(angle - headAngle), py2 - headLen * Math.sin(angle - headAngle));
+    ctx.lineTo(px2 - headLen * Math.cos(angle + headAngle), py2 - headLen * Math.sin(angle + headAngle));
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+}
+
+// FPO-style double-circle particle
+function drawDot(px, py, outerR, innerColor, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(px, py, outerR, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.fillStyle = innerColor;
+    ctx.beginPath();
+    ctx.arc(px, py, outerR * 0.5, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.restore();
+}
+
+// ===== REWARD GRADIENT BAR =====
+function drawRewardBar() {
+    if (!coordMap) return;
+
+    const barX = coordMap.pL + coordMap.pW + 14;
+    const barW = isMobile ? 10 : 14;
+    const barTop = coordMap.pT;
+    const barBot = coordMap.pT + coordMap.pH;
+    const barH = barBot - barTop;
+
+    const grad = ctx.createLinearGradient(barX, barBot, barX, barTop);
+    grad.addColorStop(0, C.cream);
+    grad.addColorStop(0.3, '#dcc8b4');
+    grad.addColorStop(0.6, '#AB8064');
+    grad.addColorStop(0.85, '#8a3a2a');
+    grad.addColorStop(1, C.burgundy);
+
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+
+    const r = barW / 2;
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(barX + r, barTop);
+    ctx.lineTo(barX + barW - r, barTop);
+    ctx.quadraticCurveTo(barX + barW, barTop, barX + barW, barTop + r);
+    ctx.lineTo(barX + barW, barBot - r);
+    ctx.quadraticCurveTo(barX + barW, barBot, barX + barW - r, barBot);
+    ctx.lineTo(barX + r, barBot);
+    ctx.quadraticCurveTo(barX, barBot, barX, barBot - r);
+    ctx.lineTo(barX, barTop + r);
+    ctx.quadraticCurveTo(barX, barTop, barX + r, barTop);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.globalAlpha = 0.3;
+    ctx.strokeStyle = C.navy;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+
+    // Upward arrow
+    const arrowX = barX + barW / 2;
+    const arrowTop = barTop - 8;
+    ctx.save();
+    ctx.globalAlpha = 0.7;
+    ctx.strokeStyle = C.navy;
+    ctx.fillStyle = C.navy;
+    ctx.lineWidth = 1.5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(arrowX, barTop + 4);
+    ctx.lineTo(arrowX, arrowTop);
+    ctx.stroke();
+    const headLen = 5;
+    ctx.beginPath();
+    ctx.moveTo(arrowX, arrowTop);
+    ctx.lineTo(arrowX - headLen * 0.6, arrowTop + headLen);
+    ctx.lineTo(arrowX + headLen * 0.6, arrowTop + headLen);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    // Labels
+    const fontSize = isMobile ? 8 : 9;
+    const labelX = barX + barW / 2;
+    ctx.save();
+    ctx.globalAlpha = 0.65;
+    ctx.font = `bold ${fontSize}px Arial`;
+    ctx.fillStyle = C.navy;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('Higher', labelX, arrowTop - 3);
+    ctx.textBaseline = 'top';
+    ctx.fillText('Lower', labelX, barBot + 4);
+    ctx.restore();
+
+    // Rotated "Reward" label
+    const rlabelX = barX + barW + (isMobile ? 8 : 10);
+    const rlabelY = barTop + barH / 2;
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.font = `bold ${isMobile ? 9 : 11}px Arial`;
+    ctx.fillStyle = C.navy;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.translate(rlabelX, rlabelY);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText('Reward', 0, 0);
+    ctx.restore();
+}
+
+// ===== TRAJECTORY RENDERING HELPERS =====
+
+// Stroke a smooth trajectory curve up to endIdx
+function strokeTraj(pts, endIdx, color, lineWidth, alpha) {
+    if (endIdx < 1) return;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+
+    ctx.beginPath();
+    const p0 = d2p(pts[0].t, pts[0].x);
+    ctx.moveTo(p0.px, p0.py);
+    for (let i = 1; i <= endIdx; i++) {
+        const p = d2p(pts[i].t, pts[i].x);
+        ctx.lineTo(p.px, p.py);
+    }
+    ctx.stroke();
+    ctx.restore();
+}
+
+// ===== ANIMATION =====
+let animStartTime = null;
+let animRunning = false;
+
+function easeInOut(t) {
+    return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+}
+function easeOut(t) {
+    return 1 - (1 - t) * (1 - t);
+}
+
+function renderFrame(elapsed) {
+    if (!ctx || !coordMap || !pairData) return;
+
+    ctx.clearRect(0, 0, canvasW, canvasH);
+
+    drawRewardBar();
+
+    const tFlow   = Math.min(1, elapsed / PHASE_FLOW);
+    const tReward = Math.max(0, Math.min(1, (elapsed - PHASE_FLOW) / PHASE_REWARD));
+    const tUpdate = Math.max(0, Math.min(1, (elapsed - PHASE_FLOW - PHASE_REWARD) / PHASE_UPDATE));
+
+    const flowProgress = easeInOut(tFlow);
+    const rewardAlpha  = easeOut(tReward);
+    const updateAlpha  = easeOut(tUpdate);
+
+    const hi = pairData.hi;
+    const lo = pairData.lo;
+
+    const hiPts = hi.pts;
+    const loPts = lo.pts;
+
+    const hiEndIdx = Math.min(hiPts.length - 1, Math.floor(flowProgress * (hiPts.length - 1)));
+    const loEndIdx = Math.min(loPts.length - 1, Math.floor(flowProgress * (loPts.length - 1)));
+
+    // --- 1. Draw lower-reward trajectory (faded, thinner) ---
+    strokeTraj(loPts, loEndIdx, C.cream, 2.5, 0.45);
+
+    // --- 2. Draw higher-reward trajectory (prominent) ---
+    strokeTraj(hiPts, hiEndIdx, C.cream, 3.5, 0.85);
+
+    // --- 3. Current position particles ---
+    if (hiEndIdx > 0) {
+        const curHi = hiPts[hiEndIdx];
+        const pH = d2p(curHi.t, curHi.x);
+        drawDot(pH.px, pH.py, 6, '#F45B69', 0.95);
+    }
+    if (loEndIdx > 0) {
+        const curLo = loPts[loEndIdx];
+        const pL = d2p(curLo.t, curLo.x);
+        drawDot(pL.px, pL.py, 5, C.grey, 0.5);
+    }
+
+    // --- 4. Shared start dot ---
+    {
+        const ps = d2p(0, pairData.x0);
+        drawDot(ps.px, ps.py, 6, C.grey, 0.65);
+    }
+
+    // --- 5. End dots at t=1 ---
+    if (rewardAlpha > 0) {
+        const pHiEnd = d2p(1.0, hi.xFinal);
+        drawDot(pHiEnd.px, pHiEnd.py, 6, '#F45B69', rewardAlpha);
+
+        const pLoEnd = d2p(1.0, lo.xFinal);
+        drawDot(pLoEnd.px, pLoEnd.py, 5, C.grey, rewardAlpha * 0.5);
+    }
+
+    // --- 6. Update arrows: FDFO copies the endpoint difference to ALL steps ---
+    // The key insight: FDFO computes the difference at the endpoints (t=1),
+    // then applies that SAME gradient estimate at every position along the trajectory.
+    if (updateAlpha > 0) {
+        // Direction: upward if hi ended higher (dy negative in pixel space)
+        const direction = hi.xFinal > lo.xFinal ? -1 : 1; // -1 = upward in pixels
+        const FIXED_ARROW_LEN = 25; // constant pixel length for copied arrows
+
+        // Helper: draw arrow with white outline then red fill (like the particle style)
+        function drawOutlinedArrow(px1, py1, px2, py2, alpha) {
+            const adx = px2 - px1, ady = py2 - py1;
+            const len = Math.sqrt(adx * adx + ady * ady);
+            if (len < 2) return;
+            const angle = Math.atan2(ady, adx);
+            const headLen = Math.min(12, len * 0.45);
+            const headAngle = 0.45;
+            // Arrowhead corners
+            const h1x = px2 - headLen * Math.cos(angle - headAngle);
+            const h1y = py2 - headLen * Math.sin(angle - headAngle);
+            const h2x = px2 - headLen * Math.cos(angle + headAngle);
+            const h2y = py2 - headLen * Math.sin(angle + headAngle);
+            // Shaft ends at arrowhead base, not at the tip
+            const shaftEndX = px2 - headLen * 0.6 * Math.cos(angle);
+            const shaftEndY = py2 - headLen * 0.6 * Math.sin(angle);
+
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+
+            // White outline: thick stroke on shaft + arrowhead
+            ctx.strokeStyle = '#ffffff';
+            ctx.fillStyle = '#ffffff';
+            ctx.lineWidth = 5;
+            ctx.beginPath(); ctx.moveTo(px1, py1); ctx.lineTo(shaftEndX, shaftEndY); ctx.stroke();
+            ctx.lineWidth = 3;
+            ctx.beginPath(); ctx.moveTo(px2, py2); ctx.lineTo(h1x, h1y); ctx.lineTo(h2x, h2y); ctx.closePath();
+            ctx.fill(); ctx.stroke();
+
+            // Red fill: thinner shaft + arrowhead
+            ctx.strokeStyle = C.burgundy;
+            ctx.fillStyle = C.burgundy;
+            ctx.lineWidth = 2.5;
+            ctx.beginPath(); ctx.moveTo(px1, py1); ctx.lineTo(shaftEndX, shaftEndY); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(px2, py2); ctx.lineTo(h1x, h1y); ctx.lineTo(h2x, h2y); ctx.closePath();
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        // 6a. Source arrow at t=1: from lower-reward endpoint to higher-reward endpoint
+        // This spans the full endpoint difference (variable size).
+        {
+            const pLo = d2p(1.0, lo.xFinal);
+            const pHi = d2p(1.0, hi.xFinal);
+            drawOutlinedArrow(pLo.px, pLo.py, pHi.px, pHi.py, updateAlpha);
+        }
+
+        // 6b. Copied arrows along the higher-reward trajectory
+        // Each arrow is a FIXED size, same direction, originating from the hi trajectory.
+        const nArrows = 10;
+        for (let a = 0; a < nArrows; a++) {
+            const frac = (a + 0.5) / nArrows;
+            // Stagger appearance slightly
+            const arrowAlpha = updateAlpha * Math.max(0, Math.min(1,
+                (updateAlpha - frac * 0.2) / 0.8));
+            if (arrowAlpha <= 0) continue;
+
+            const hiIdx = Math.min(hiPts.length - 1, Math.floor(frac * (hiPts.length - 1)));
+            const pAnchor = d2p(hiPts[hiIdx].t, hiPts[hiIdx].x);
+
+            var offset = 0;
+            drawOutlinedArrow(pAnchor.px, pAnchor.py + direction * offset,
+                              pAnchor.px, pAnchor.py + direction * (FIXED_ARROW_LEN + offset),
+                              arrowAlpha);
+        }
+    }
+}
+
+function animationLoop(timestamp) {
+    if (!animStartTime) animStartTime = timestamp;
+    const elapsed = (timestamp - animStartTime) / 1000;
+
+    if (elapsed > TOTAL_DURATION) {
+        renderFrame(TOTAL_DURATION - 0.01);
+        animStartTime = null;
+        setTimeout(() => {
+            if (animRunning) {
+                generateTrajectory();
+                animStartTime = null;
+                requestAnimationFrame(animationLoop);
+            }
+        }, 600);
+        return;
+    }
+
+    renderFrame(elapsed);
+    if (animRunning) requestAnimationFrame(animationLoop);
+}
+
+function startAnimation() {
+    animRunning = true;
+    animStartTime = null;
+    requestAnimationFrame(animationLoop);
+}
+
+function stopAnimation() {
+    animRunning = false;
+}
+
+function restartAnimation() {
+    stopAnimation();
+    generateTrajectory();
+    setupCanvas();
+    startAnimation();
+}
+
+// ===== INIT =====
+async function init() {
+    await plotFlow();
+    await new Promise(r => setTimeout(r, 120));
+    setupCanvas();
+    generateTrajectory();
+    startAnimation();
+}
+
+let resizeTimer;
+window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(async () => {
+        await plotFlow();
+        await new Promise(r => setTimeout(r, 80));
+        setupCanvas();
+    }, 200);
+});
+
+init();
+</script>
+</body>
+</html>

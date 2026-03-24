@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gradient Comparison — Backprop vs FDFO</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Helvetica Neue',Arial,sans-serif;background:#FAF8F5;color:#050532;overflow-x:hidden}
+.wrap{max-width:860px;margin:0 auto;padding:16px}
+.tabs{display:flex;gap:6px;justify-content:center;margin-bottom:14px;flex-wrap:wrap}
+.tab{padding:8px 20px;font:bold 13px/1 'Helvetica Neue',Arial,sans-serif;border:2px solid #050532;border-radius:6px;cursor:pointer;background:#FAF8F5;color:#050532;user-select:none;transition:background .15s,color .15s}
+.tab.active{background:#050532;color:#FAF8F5}
+.tab:hover{opacity:.85}
+.panels{display:flex;gap:16px;justify-content:center;flex-wrap:wrap}
+.panel{flex:1;min-width:320px;max-width:420px}
+.panel-title{text-align:center;font:bold 15px/1.4 'Helvetica Neue',Arial,sans-serif;margin-bottom:8px;color:#050532}
+.panel-subtitle{text-align:center;font:12px/1.4 'Helvetica Neue',Arial,sans-serif;color:#656C75;margin-bottom:10px}
+canvas{width:100%;aspect-ratio:3/2;border-radius:10px;border:1.5px solid #e0ddd8;display:block;background:#FAF8F5}
+.legend{display:flex;gap:16px;justify-content:center;margin-top:12px;flex-wrap:wrap}
+.legend-item{display:flex;align-items:center;gap:5px;font:12px/1 'Helvetica Neue',Arial,sans-serif;color:#656C75}
+.legend-swatch{width:14px;height:4px;border-radius:2px}
+.controls{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px;flex-wrap:wrap}
+.controls label{font:bold 12px/1 'Helvetica Neue',Arial,sans-serif;color:#656C75}
+.play-btn{width:34px;height:34px;border-radius:50%;border:2px solid #732424;background:#FAF8F5;color:#732424;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s,color .15s}
+.play-btn.playing{background:#732424;color:#FAF8F5}
+.play-btn:hover{opacity:.85}
+input[type=range]{width:200px;height:4px;border-radius:4px;background:#ddd;outline:none;-webkit-appearance:none;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#050532;cursor:pointer}
+input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#050532;cursor:pointer;border:none}
+.caption{text-align:center;margin-top:12px;color:#656C75;font:12px/1.6 'Helvetica Neue',Arial,sans-serif;max-width:700px;margin-left:auto;margin-right:auto}
+.angle-readout{text-align:center;font:bold 13px/1.4 'Helvetica Neue',Arial,sans-serif;margin-top:8px;min-height:20px;color:#050532}
+@media(max-width:700px){.panels{flex-direction:column;align-items:center}.panel{max-width:100%}input[type=range]{width:140px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="tabs">
+    <div class="tab active" data-mode="sidebyside">Side by Side</div>
+    <div class="tab" data-mode="backprop">Backprop Only</div>
+    <div class="tab" data-mode="fdfo">FDFO Only</div>
+  </div>
+  <div class="panels" id="panels"></div>
+  <div class="angle-readout" id="readout"></div>
+  <div class="controls">
+    <button class="play-btn" id="playBtn" title="Animate">&#9654;</button>
+    <label>Propagation step:</label>
+    <input type="range" id="stepSlider" min="0" max="80" value="80">
+    <span id="stepLabel" style="font:bold 12px/1 'Helvetica Neue',Arial,sans-serif;color:#050532;min-width:24px">8/8</span>
+  </div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-swatch" style="background:#050532"></div>Original &#8711;R</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:linear-gradient(90deg,#2a7d3f,#c9a820,#c05e20,#a02020)"></div>Degraded (backprop)</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#050532"></div>Copied (FDFO)</div>
+  </div>
+  <div class="caption">
+    <b>Backprop</b> propagates the reward gradient &#8711;R backward through each step's Jacobian J<sub>t</sub>.
+    Each Jacobian rotates and scales the gradient, accumulating distortion.
+    <b>FDFO</b> simply copies the reward gradient to every step — valid when J<sub>t</sub> is PSD (angle &lt; 90&deg;).
+  </div>
+</div>
+
+<script>
+// ==========================================================
+// State
+// ==========================================================
+const T = 8;
+let mode = 'sidebyside'; // 'sidebyside' | 'backprop' | 'fdfo'
+let animStep = 80; // 0..80 (10 sub-steps per step)
+let playing = false;
+let animId = null;
+let lastTime = 0;
+
+// ==========================================================
+// Jacobians — precomputed random-ish PSD-ish matrices
+// Each J_t rotates by some angle and scales
+// ==========================================================
+const jacobians = [];
+const seed = 42;
+function seededRand(s) {
+  let x = Math.sin(s * 9137.17 + 1.618) * 43758.5453;
+  return x - Math.floor(x);
+}
+for (let i = 0; i < T; i++) {
+  // Each Jacobian: rotation + anisotropic scaling
+  const angle = (seededRand(i * 3 + seed) - 0.5) * 0.55; // rotation ±~16°
+  const s1 = 0.7 + seededRand(i * 3 + 1 + seed) * 0.5;   // scale 0.7-1.2
+  const s2 = 0.6 + seededRand(i * 3 + 2 + seed) * 0.4;   // scale 0.6-1.0
+  const c = Math.cos(angle), s = Math.sin(angle);
+  // J = R * diag(s1, s2) * R^T  (so it's symmetric → PSD-ish if eigenvalues positive)
+  // But we want some steps to introduce significant rotation to show degradation
+  // Use J = R(angle) * diag(s1, s2) — not symmetric, shows rotation+scaling
+  jacobians.push([
+    [c * s1, -s * s2],
+    [s * s1,  c * s2]
+  ]);
+}
+
+// Compute backprop gradient chain: g_T = ∇R, g_t = J_t^T * g_{t+1}
+function computeBackpropChain(gradR) {
+  const chain = new Array(T + 1);
+  chain[T] = [gradR[0], gradR[1]];
+  for (let t = T - 1; t >= 0; t--) {
+    const J = jacobians[t];
+    // J^T * g
+    const gx = J[0][0] * chain[t + 1][0] + J[1][0] * chain[t + 1][1];
+    const gy = J[0][1] * chain[t + 1][0] + J[1][1] * chain[t + 1][1];
+    chain[t] = [gx, gy];
+  }
+  return chain;
+}
+
+// Angle between two 2D vectors (degrees)
+function angleBetween(a, b) {
+  const dot = a[0] * b[0] + a[1] * b[1];
+  const ma = Math.sqrt(a[0] * a[0] + a[1] * a[1]);
+  const mb = Math.sqrt(b[0] * b[0] + b[1] * b[1]);
+  if (ma < 1e-10 || mb < 1e-10) return 0;
+  return Math.acos(Math.max(-1, Math.min(1, dot / (ma * mb)))) * 180 / Math.PI;
+}
+
+// Original reward gradient direction (pointing "up-right")
+const gradR = [0.6, 0.8];
+const bpChain = computeBackpropChain(gradR);
+
+// Normalize to unit for display, but keep magnitude info
+function norm(v) {
+  const m = Math.sqrt(v[0] * v[0] + v[1] * v[1]);
+  return m > 1e-10 ? [v[0] / m, v[1] / m] : [0, 0];
+}
+function mag(v) { return Math.sqrt(v[0] * v[0] + v[1] * v[1]); }
+
+// ==========================================================
+// Color for degradation: green → yellow → orange → red
+// ==========================================================
+function degradeColor(angle) {
+  // angle: 0..90+
+  const t = Math.min(angle / 90, 1);
+  // green(46,125,63) → yellow(201,168,32) → orange(192,94,32) → red(160,32,32)
+  let r, g, b;
+  if (t < 0.33) {
+    const u = t / 0.33;
+    r = 46 + (201 - 46) * u;
+    g = 125 + (168 - 125) * u;
+    b = 63 + (32 - 63) * u;
+  } else if (t < 0.66) {
+    const u = (t - 0.33) / 0.33;
+    r = 201 + (192 - 201) * u;
+    g = 168 + (94 - 168) * u;
+    b = 32;
+  } else {
+    const u = (t - 0.66) / 0.34;
+    r = 192 + (160 - 192) * u;
+    g = 94 + (32 - 94) * u;
+    b = 32;
+  }
+  return `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
+}
+
+// ==========================================================
+// Drawing
+// ==========================================================
+function createCanvas(container) {
+  const c = document.createElement('canvas');
+  container.appendChild(c);
+  return c;
+}
+
+function setupCanvas(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: rect.width, h: rect.height };
+}
+
+// Draw a single panel (backprop or fdfo)
+function drawPanel(canvas, type, step) {
+  const { ctx, w, h } = setupCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+
+  const boxW = 38, boxH = 50;
+  const gap = (w - 20 - T * boxW) / (T - 1);
+  const cy = h * 0.50;
+  const startX = 10;
+
+  // fractional step: 0..80 → step 0..8 with sub-interpolation
+  const fullStep = step / 10;
+  const currentStep = Math.floor(fullStep);
+  const subT = fullStep - currentStep;
+
+  // Draw chain boxes
+  for (let i = 0; i < T; i++) {
+    const x = startX + i * (boxW + gap);
+    const isActive = (T - 1 - i) <= currentStep;
+
+    // Box
+    ctx.fillStyle = isActive ? '#f0eeea' : '#f5f3ef';
+    ctx.strokeStyle = isActive ? '#050532' : '#c8c5be';
+    ctx.lineWidth = isActive ? 1.8 : 1;
+    ctx.beginPath();
+    ctx.roundRect(x, cy - boxH / 2, boxW, boxH, 5);
+    ctx.fill();
+    ctx.stroke();
+
+    // Step label
+    ctx.fillStyle = isActive ? '#050532' : '#c8c5be';
+    ctx.font = 'bold 10px "Helvetica Neue",Arial,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`t=${i + 1}`, x + boxW / 2, cy - boxH / 2 - 5);
+
+    // Jacobian label
+    if (i < T - 1) {
+      ctx.fillStyle = '#656C75';
+      ctx.font = '9px "Helvetica Neue",Arial,sans-serif';
+      ctx.fillText('J' + (i + 1), x + boxW + gap / 2, cy - boxH / 2 - 5);
+    }
+  }
+
+  // "R" label and reward arrow at far right
+  const rewardX = startX + (T - 1) * (boxW + gap) + boxW + 12;
+  ctx.fillStyle = '#050532';
+  ctx.font = 'bold 12px "Helvetica Neue",Arial,sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('R(x)', Math.min(rewardX, w - 36), cy - 6);
+
+  // Draw gradient arrows at each step
+  const arrowLen = Math.min(boxW * 0.55, 20);
+
+  for (let i = T - 1; i >= 0; i--) {
+    const stepsFromEnd = T - 1 - i;
+    if (stepsFromEnd > currentStep) continue;
+
+    const x = startX + i * (boxW + gap) + boxW / 2;
+
+    // Fade-in for the currently appearing step
+    let alpha = 1;
+    if (stepsFromEnd === currentStep) {
+      alpha = subT;
+    }
+
+    let dir, color, arrowMag;
+
+    if (type === 'fdfo') {
+      // FDFO: same gradient everywhere
+      dir = norm(gradR);
+      color = '#050532';
+      arrowMag = 1;
+    } else {
+      // Backprop: use chain
+      const g = bpChain[i];
+      const originalMag = mag(gradR);
+      arrowMag = Math.min(mag(g) / originalMag, 2);
+      dir = norm(g);
+      const angle = angleBetween(g, gradR);
+      color = degradeColor(angle);
+    }
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(x, cy);
+
+    // Arrow body
+    const len = arrowLen * Math.max(0.3, Math.min(arrowMag, 1.5));
+    const headLen = 7;
+    const angle = Math.atan2(-dir[1], dir[0]); // flip y for canvas
+
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+
+    // Shaft
+    ctx.beginPath();
+    ctx.moveTo(-Math.cos(angle) * len * 0.4, Math.sin(angle) * len * 0.4);
+    ctx.lineTo(Math.cos(angle) * len * 0.6, -Math.sin(angle) * len * 0.6);
+    ctx.stroke();
+
+    // Arrowhead
+    const tipX = Math.cos(angle) * len * 0.6;
+    const tipY = -Math.sin(angle) * len * 0.6;
+    ctx.beginPath();
+    ctx.moveTo(tipX, tipY);
+    ctx.lineTo(tipX - Math.cos(angle - 0.45) * headLen, tipY + Math.sin(angle - 0.45) * headLen);
+    ctx.lineTo(tipX - Math.cos(angle + 0.45) * headLen, tipY + Math.sin(angle + 0.45) * headLen);
+    ctx.closePath();
+    ctx.fill();
+
+    // Angle annotation for backprop
+    if (type === 'backprop' && stepsFromEnd <= currentStep) {
+      const a = angleBetween(bpChain[i], gradR);
+      ctx.font = 'bold 9px "Helvetica Neue",Arial,sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = color;
+      ctx.fillText(Math.round(a) + '\u00B0', 0, boxH / 2 + 13);
+    }
+
+    ctx.restore();
+  }
+
+  // Connection lines between boxes (showing gradient flow direction)
+  for (let i = T - 2; i >= 0; i--) {
+    const stepsFromEnd = T - 1 - i;
+    if (stepsFromEnd > currentStep) continue;
+
+    let alpha = 1;
+    if (stepsFromEnd === currentStep) alpha = subT;
+
+    const x1 = startX + i * (boxW + gap) + boxW;
+    const x2 = startX + (i + 1) * (boxW + gap);
+    const midY = cy;
+
+    ctx.save();
+    ctx.globalAlpha = alpha * 0.3;
+    ctx.strokeStyle = '#050532';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x2, midY);
+    ctx.lineTo(x1, midY);
+    ctx.stroke();
+
+    // Small leftward chevron
+    ctx.fillStyle = '#050532';
+    ctx.beginPath();
+    ctx.moveTo(x1 + 2, midY);
+    ctx.lineTo(x1 + 6, midY - 3);
+    ctx.lineTo(x1 + 6, midY + 3);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  // Title inside panel top
+  ctx.fillStyle = type === 'fdfo' ? '#050532' : '#732424';
+  ctx.font = 'bold 12px "Helvetica Neue",Arial,sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(type === 'fdfo' ? 'FDFO — Copy Gradient' : 'Backprop — Chain Rule', w / 2, 18);
+}
+
+// ==========================================================
+// Render
+// ==========================================================
+function render() {
+  const container = document.getElementById('panels');
+  const canvases = container.querySelectorAll('canvas');
+  const step = animStep;
+
+  if (mode === 'sidebyside') {
+    drawPanel(canvases[0], 'backprop', step);
+    drawPanel(canvases[1], 'fdfo', step);
+  } else if (mode === 'backprop') {
+    drawPanel(canvases[0], 'backprop', step);
+  } else {
+    drawPanel(canvases[0], 'fdfo', step);
+  }
+
+  // Update readout
+  const fullStep = step / 10;
+  const currentStep = Math.min(Math.floor(fullStep), T - 1);
+  const readout = document.getElementById('readout');
+  if (mode === 'fdfo' || mode === 'sidebyside') {
+    // Show the first (leftmost) active step's angle for backprop
+    const idx = T - 1 - currentStep;
+    if (idx >= 0 && idx < T) {
+      const angle = angleBetween(bpChain[idx], gradR);
+      if (mode === 'sidebyside') {
+        readout.textContent = `Step ${currentStep + 1}/${T} propagated \u2014 Backprop gradient angle from original: ${Math.round(angle)}\u00B0`;
+      } else {
+        readout.textContent = `FDFO: gradient angle = 0\u00B0 at every step (exact copy)`;
+      }
+    }
+  } else {
+    const idx = T - 1 - currentStep;
+    if (idx >= 0 && idx < T) {
+      const angle = angleBetween(bpChain[idx], gradR);
+      readout.textContent = `Backprop: gradient angle from original at step ${idx + 1}: ${Math.round(angle)}\u00B0`;
+    }
+  }
+
+  document.getElementById('stepLabel').textContent = `${Math.min(currentStep + 1, T)}/${T}`;
+}
+
+function rebuild() {
+  const container = document.getElementById('panels');
+  container.innerHTML = '';
+
+  if (mode === 'sidebyside') {
+    const p1 = document.createElement('div');
+    p1.className = 'panel';
+    const p2 = document.createElement('div');
+    p2.className = 'panel';
+    const c1 = createCanvas(p1);
+    const c2 = createCanvas(p2);
+    container.appendChild(p1);
+    container.appendChild(p2);
+  } else {
+    const p = document.createElement('div');
+    p.className = 'panel';
+    p.style.maxWidth = '700px';
+    const c = createCanvas(p);
+    container.appendChild(p);
+  }
+
+  // Need to wait for layout before drawing
+  requestAnimationFrame(render);
+}
+
+// ==========================================================
+// Interaction
+// ==========================================================
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    mode = tab.dataset.mode;
+    rebuild();
+  });
+});
+
+const slider = document.getElementById('stepSlider');
+slider.addEventListener('input', () => {
+  animStep = parseInt(slider.value);
+  render();
+});
+
+const playBtn = document.getElementById('playBtn');
+function togglePlay() {
+  playing = !playing;
+  playBtn.classList.toggle('playing', playing);
+  playBtn.innerHTML = playing ? '&#9646;&#9646;' : '&#9654;';
+  if (playing) {
+    animStep = 0;
+    slider.value = 0;
+    lastTime = performance.now();
+    animId = requestAnimationFrame(animate);
+  } else if (animId) {
+    cancelAnimationFrame(animId);
+    animId = null;
+  }
+}
+playBtn.addEventListener('click', togglePlay);
+
+function animate(ts) {
+  if (!playing) return;
+  const dt = ts - lastTime;
+  if (dt > 80) { // ~12 fps for smooth propagation
+    lastTime = ts;
+    animStep += 2;
+    if (animStep > 80) {
+      animStep = 80;
+      playing = false;
+      playBtn.classList.remove('playing');
+      playBtn.innerHTML = '&#9654;';
+    }
+    slider.value = animStep;
+    render();
+  }
+  if (playing) animId = requestAnimationFrame(animate);
+}
+
+// Resize
+window.addEventListener('resize', () => {
+  render();
+});
+
+// Init
+rebuild();
+</script>
+</body>
+</html>
