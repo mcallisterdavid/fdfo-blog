@@ -9,7 +9,7 @@
 html,body{height:100%;overflow:hidden}
 body{font-family:Arial,sans-serif;background:#fff}
 .wrap{height:100%;display:flex;flex-direction:column;align-items:center;padding:0 12px 6px}
-.cbox{flex:0 0 auto;width:100%;aspect-ratio:1.4/1;max-height:calc(100vh - 100px);border-radius:16px;overflow:hidden;background:#0C3383;cursor:crosshair;position:relative}
+.cbox{flex:0 0 auto;width:100%;aspect-ratio:1.4/1;max-height:calc(100vh - 100px);border-radius:16px;overflow:hidden;background:#081D5E;cursor:crosshair;position:relative}
 #bg,#fg{border-radius:16px}
 #bg{position:absolute;top:0;left:0;width:100%;height:100%;image-rendering:auto}
 #fg{position:absolute;top:0;left:0;width:100%;height:100%}
@@ -48,10 +48,10 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
 // Plotly Portland colorscale (matches FPO flow_sde_plot.html)
 // ================================================================
 const PORTLAND_STOPS = [
-  {t:0.0,  r:12,  g:51,  b:131},  // #0C3383 dark blue
+  {t:0.0,  r:8,   g:29,  b:94},   // #081D5E dark navy
   {t:0.25, r:10,  g:136, b:186},  // #0A88BA teal
   {t:0.5,  r:242, g:211, b:56},   // #F2D338 yellow
-  {t:0.75, r:242, g:143, b:56},   // #F28F38 orange
+  {t:0.9, r:242, g:143, b:56},   // #F28F38 orange
   {t:1.0,  r:217, g:30,  b:30},   // #D91E1E red
 ];
 
@@ -76,8 +76,8 @@ function portlandColor(t) {
 // Style constants
 // ================================================================
 const STYLE = {
-  bg: '#0C3383',
-  bgRGB: [12, 51, 131],
+  bg: '#081D5E',
+  bgRGB: [8, 29, 94],
 
   // Tree branches: all red to match heatmap high-density color
   treeTrunkRGB: [217, 30, 30],    // red (Portland hot end)
@@ -89,8 +89,8 @@ const STYLE = {
 
   // Gradient arrows
   burgundy:  '#FFFFFF',           // hero/reward arrow in white
-  navyRGB:   [12, 51, 131],
-  navyHex:   '#0C3383',
+  navyRGB:   [8, 29, 94],
+  navyHex:   '#081D5E',
 
   // Angle deviation colors (teal -> yellow -> red, matching Portland)
   angleMidRGB: [242, 211, 56],
@@ -136,8 +136,8 @@ const STYLE = {
 
   // View
   canvasAR: 1.4,
-  padLoFrac: 0.06,
-  padHiFrac: 0.42,
+  padLoFrac: 0.20,
+  padHiFrac: 0.28,
   initX0: [0.72, 0.68],
 
   // Animation timing
@@ -258,8 +258,11 @@ for (const c of COMPS) {
   VX1 = Math.max(VX1, c.mu[0] + r);
   VY1 = Math.max(VY1, c.mu[1] + r);
 }
-const padLo = STYLE.padLoFrac * Math.max(VX1 - VX0, VY1 - VY0);
-VX0 -= padLo; VY0 -= padLo;
+// Extend viewport below/left of origin to show part of class B (the mirrored tree)
+const classASpan = Math.max(VX1 - ORIGIN_SX, VY1 - ORIGIN_SY);
+const classBShow = 0.35; // fraction of class A span to show of class B
+VX0 = ORIGIN_SX - classASpan * classBShow;
+VY0 = ORIGIN_SY - classASpan * classBShow;
 const padHi = STYLE.padHiFrac * Math.max(VX1 - VX0, VY1 - VY0);
 VX1 += padHi; VY1 += padHi;
 const span = Math.max(VX1 - VX0, VY1 - VY0);
@@ -357,7 +360,7 @@ function computeHeatmap() {
 
   // ── TUNING KNOBS ──
   // sigma_scale: how wide each branch's glow is relative to its visual width
-  const sigma_scale = 1.1;
+  const sigma_scale = 2.0;
   // gamma: power curve on the final value (< 1 = more red, > 1 = less red)
   const gamma = 1.8;
 
@@ -365,7 +368,7 @@ function computeHeatmap() {
   const approxScale = res / (VX1 - VX0);
   const branchInfo = [];
   for (const br of BRANCHES) {
-    if (br.cls !== 'A') continue;
+    if (br.depth >= 5) continue;
     const wPx = Math.max(STYLE.taperFloorBase, STYLE.taperWidth * Math.pow(STYLE.taperDecay, br.depth));
     const wData = wPx / approxScale;
     const sigma = wData * sigma_scale;
