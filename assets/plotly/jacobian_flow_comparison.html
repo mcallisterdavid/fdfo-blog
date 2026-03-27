@@ -28,8 +28,8 @@ body{font-family:Arial,sans-serif;background:#fff}
     <div class="loading" id="loadMsg">Computing density...</div>
   </div>
   <div class="legend-row">
-    <span><span class="legend-swatch" style="background:#FFFFFF"></span><span style="color:#FFFFFF">Backprop gradient</span></span>
-    <span><span class="legend-swatch" style="background:#0A88BA"></span><span style="color:#0A88BA">Copy gradient</span></span>
+    <span><span class="legend-swatch" style="background:#FFFFFF; border:1px solid #999"></span><span style="color:#333">Backprop gradient</span></span>
+    <span><span class="legend-swatch" style="background:#FFE44D"></span><span style="color:#333">Copy gradient</span></span>
   </div>
   <div class="cap">
     Backpropagated gradients are rotated and scaled by the Jacobian at each step.
@@ -82,7 +82,7 @@ const STYLE = {
   navyHex: '#081D5E',
 
   copyRGB: [10, 136, 186],
-  copyHex: '#0A88BA',
+  copyHex: '#EAD058',
 
   angleMidRGB: [255, 255, 255],
   angleBadRGB: [255, 255, 255],
@@ -685,9 +685,10 @@ function render() {
     const [ppx, ppy] = d2p(ap.pos[0], ap.pos[1]);
     const pJT = m2T(ap.J);
     const pG = m2v(pJT, gDir);
+    const pMag = vl(pG);
     const pDir = vn(pG);
     const pDeg = aVec(pG, gDir) * 180 / Math.PI;
-    const dLen = arrowLen;
+    const dLen = arrowLen * pMag;
 
     const baseAlpha = STYLE.trailAlphaFloor;
 
@@ -702,9 +703,9 @@ function render() {
 
     // Copy gradient arrow (teal)
     {
-      const tx = ap.pos[0] + gDir[0] * dLen, ty = ap.pos[1] + gDir[1] * dLen;
+      const tx = ap.pos[0] + gDir[0] * arrowLen, ty = ap.pos[1] + gDir[1] * arrowLen;
       const [tpx, tpy] = d2p(tx, ty);
-      fgCtx.globalAlpha = baseAlpha * 0.75;
+      fgCtx.globalAlpha = 1;
       arrow(ppx, ppy, tpx, tpy, STYLE.copyHex, STYLE.copyTrailW, STYLE.copyTrailHead);
       fgCtx.globalAlpha = 1;
 
@@ -791,7 +792,7 @@ function drawGradLegend(ctx) {
   // Label (white)
   ctx.fillStyle = '#FFFFFF'; ctx.font = 'bold 11px Arial';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText('\u2207R', cx, cy + STYLE.legendR + 12);
+  ctx.fillText('Reward Gradient', cx, cy + STYLE.legendR + 12);
 
   // Drag hint ring
   ctx.strokeStyle = rgba([255, 255, 255], 0.1); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);

@@ -812,6 +812,7 @@ function render() {
   // -- Gradient arrows --
   const curJ = lerpJac(curF), curJT = m2T(curJ);
   const eG = m2v(curJT, gDir);
+  const eMag = vl(eG);
   const eDir = vn(eG);
   const aDeg = aVec(eG, gDir) * 180 / Math.PI;
   const isAtEnd = (curF >= N_STEPS - 0.01);
@@ -829,6 +830,7 @@ function render() {
       const [ppx, ppy] = d2p(ap.pos[0], ap.pos[1]);
       const pJT = m2T(ap.J);
       const pG = m2v(pJT, gDir);
+      const pMag = vl(pG);
       const pDir = vn(pG);
 
       let growFactor;
@@ -848,7 +850,7 @@ function render() {
         }
       }
 
-      const curLen = arrowLen * growFactor;
+      const curLen = arrowLen * pMag * growFactor;
       const tx = ap.pos[0] + pDir[0] * curLen;
       const ty = ap.pos[1] + pDir[1] * curLen;
       const [tpx, tpy] = d2p(tx, ty);
@@ -876,8 +878,9 @@ function render() {
       const [ppx, ppy] = d2p(ap.pos[0], ap.pos[1]);
       const pJT = m2T(ap.J);
       const pG = m2v(pJT, gDir);
+      const pMag = vl(pG);
       const pDir = vn(pG);
-      const dLen = arrowLen;
+      const dLen = arrowLen * pMag;
 
       const dist = Math.abs(ap.stepF - curF);
       const baseAlpha = Math.max(STYLE.trailAlphaFloor, STYLE.trailAlpha - dist * STYLE.trailAlphaFade);
@@ -890,7 +893,7 @@ function render() {
     }
 
     // Hero arrow at current position
-    const bigLen = arrowLen * STYLE.heroScale;
+    const bigLen = arrowLen * eMag * STYLE.heroScale;
     const tx = curPos[0] + eDir[0] * bigLen;
     const ty = curPos[1] + eDir[1] * bigLen;
     const [tpx, tpy] = d2p(tx, ty);
