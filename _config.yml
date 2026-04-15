@@ -15,7 +15,7 @@ footer_text: >
   Hosted by <a href="https://pages.github.com/" target="_blank">GitHub Pages</a>.
 keywords: Finite Difference Flow Optimization, FDFO, flow matching, diffusion models, reinforcement learning # add your own keywords or leave empty
 lang: en # the language of your site (for example: en, fr, cn, ru, etc.)
-icon: fmpg-icon2.jpg # the emoji used as the favicon (alternatively, provide image name in /assets/img/)
+icon: fdfo/first_last_frames/005-r04-a-cat-floating-inside-the-international-space-st_last.png # favicon image path under /assets/img/
 
 url: https://mcallisterdavid.com # the base hostname & protocol for your site
 baseurl: /fdfo-blog # the subpath of your site, e.g. /blog/. Leave blank for root
