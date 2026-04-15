@@ -36,6 +36,10 @@
     font-size: 16px;
     font-weight: 650;
   }
+  .card-title-sm {
+    font-size: 15px;
+    font-weight: 650;
+  }
   .card-sub {
     font-size: 12px;
     fill: #64748b;
@@ -52,47 +56,56 @@
 </style>
 </head>
 <body>
-<svg viewBox="0 0 960 184" xmlns="http://www.w3.org/2000/svg" aria-label="FDFO post-training loop">
+<svg viewBox="0 0 960 208" xmlns="http://www.w3.org/2000/svg" aria-label="FDFO post-training loop">
   <defs>
-    <marker id="arrow-slate" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-      <path d="M0,0 L10,5 L0,10 Z" fill="#94a3b8"/>
+    <marker id="arrow-slate" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L7,4 L0,8 Z" fill="#94a3b8"/>
     </marker>
-    <marker id="arrow-ink" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-      <path d="M0,0 L10,5 L0,10 Z" fill="#0f172a"/>
-    </marker>
+    <clipPath id="generated-thumb-clip">
+      <rect x="558" y="72" width="56" height="56" rx="6"/>
+    </clipPath>
   </defs>
 
   <text x="24" y="28" class="title">Post-Training Loop</text>
-  <text x="24" y="46" class="subtitle">sample → score → update</text>
+  <text x="24" y="46" class="subtitle">Sample → Score → update</text>
 
-  <rect x="24" y="64" width="160" height="74" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="24" y="64" width="160" height="82" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
   <rect x="38" y="82" width="60" height="22" rx="11" fill="#e2e8f0"/>
   <rect x="104" y="82" width="52" height="22" rx="11" fill="#e2e8f0"/>
   <text x="68" y="97" text-anchor="middle" class="chip" fill="#334155">prompt c</text>
   <text x="130" y="97" text-anchor="middle" class="chip" fill="#334155">noise x₀</text>
-  <text x="104" y="118" text-anchor="middle" class="card-sub">draw a rollout seed</text>
+  <text x="104" y="124" text-anchor="middle" class="card-sub">Draw a sample to roll out</text>
 
-  <rect x="226" y="64" width="232" height="74" rx="12" fill="#0f172a"/>
-  <text x="246" y="93" class="card-title" fill="#ffffff">Current flow model v<tspan baseline-shift="sub" font-size="12">θ</tspan></text>
-  <text x="246" y="114" class="card-sub-light">sample an image trajectory</text>
-  <path d="M246 125 C266 114, 286 114, 306 125 S346 136, 366 125 S406 114, 426 125" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="2.2" stroke-linecap="round"/>
+  <rect x="220" y="64" width="238" height="82" rx="12" fill="#0f172a"/>
+  <text x="339" y="92" text-anchor="middle" class="card-title" fill="#ffffff">Current flow model v<tspan baseline-shift="sub" font-size="12">θ</tspan></text>
+  <text x="339" y="113" text-anchor="middle" class="card-sub-light">sample an image trajectory</text>
+  <path d="M250 130 C271 118, 292 118, 313 130 S355 142, 376 130 S418 118, 428 130" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="2.2" stroke-linecap="round"/>
 
-  <rect x="500" y="64" width="158" height="74" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
-  <rect x="544" y="82" width="70" height="38" fill="none" stroke="#94a3b8" stroke-width="1.5"/>
-  <polyline points="548,115 567,96 583,108 599,89 610,100" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-  <text x="579" y="132" text-anchor="middle" class="card-sub">generated image x₁</text>
+  <rect x="496" y="64" width="180" height="82" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="558" y="72" width="56" height="56" rx="6" fill="#e2e8f0" stroke="#cbd5e1" stroke-width="1"/>
+  <image
+    href="../img/fdfo/first_last_frames/005-r04-a-cat-floating-inside-the-international-space-st_last.png"
+    x="558"
+    y="72"
+    width="56"
+    height="56"
+    preserveAspectRatio="xMidYMid slice"
+    clip-path="url(#generated-thumb-clip)"
+  />
+  <text x="586" y="141" text-anchor="middle" class="card-title-sm" fill="#0f172a">Generated Image</text>
 
-  <rect x="700" y="64" width="236" height="74" rx="12" fill="#fff7ed" stroke="#c58b4d" stroke-width="1.5"/>
-  <text x="720" y="92" class="card-title" fill="#7c2d12">Reward signal r</text>
-  <text x="720" y="112" class="card-sub" fill="#9a3412">VLM, PickScore, or human preference</text>
-  <text x="720" y="128" class="card-sub" fill="#9a3412">turns the sample into a scalar objective</text>
+  <rect x="714" y="64" width="222" height="82" rx="12" fill="#fff7ed" stroke="#c58b4d" stroke-width="1.5"/>
+  <text x="825" y="90" text-anchor="middle" class="card-title" fill="#7c2d12">Reward Function</text>
+  <text x="825" y="111" text-anchor="middle" textLength="182" lengthAdjust="spacingAndGlyphs" class="card-sub" fill="#9a3412">Learned model or human labels</text>
+  <text x="825" y="127" text-anchor="middle" textLength="176" lengthAdjust="spacingAndGlyphs" class="card-sub" fill="#9a3412">map samples to scalar rewards</text>
 
-  <line x1="184" y1="101" x2="212" y2="101" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
-  <line x1="458" y1="101" x2="486" y2="101" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
-  <line x1="658" y1="101" x2="686" y2="101" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
+  <line x1="184" y1="105" x2="220" y2="105" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
+  <line x1="458" y1="105" x2="496" y2="105" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
+  <line x1="676" y1="105" x2="714" y2="105" stroke="#94a3b8" stroke-width="2.5" marker-end="url(#arrow-slate)"/>
 
-  <path d="M818 138 C818 166, 520 172, 342 172 C270 172, 248 158, 248 146" fill="none" stroke="#0f172a" stroke-width="2.5" marker-end="url(#arrow-ink)"/>
-  <text x="528" y="167" text-anchor="middle" class="subtitle" fill="#0f172a">use r to update θ with FDFO, then resample</text>
+  <path d="M825 146 L825 162 C825 170, 812 176, 796 176 L360 176 C344 176, 332 168, 332 154 L332 146" fill="none" stroke="#0f172a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <polygon points="332,146 327,154 337,154" fill="#0f172a"/>
+  <text x="579" y="196" text-anchor="middle" class="subtitle" fill="#0f172a">Use reward to update θ, then resample</text>
 </svg>
 </body>
 </html>
